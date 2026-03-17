@@ -18,6 +18,9 @@ from parselmouth.praat import call
 import time
 import joblib
 import pandas as pd
+import threading
+import ctypes
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from functools import wraps
 
 # ===================== 核心配置 =====================
@@ -30,6 +33,7 @@ CONFIG = {
     "PD_THRESHOLD": 0.5,
     "MIN_AUDIO_DURATION": 1.0,
     "MAX_AUDIO_DURATION": 210.0,
+    "ANALYSIS_TIMEOUT_SECONDS": 180,
     
     # 7个目标特征（从SHAP重要性文件得知）
     "TARGET_FEATURES": [
@@ -751,11 +755,19 @@ def pd_diagnose():
         if not valid:
             return jsonify({"code": 400, "msg": msg}), 400
         
-        logger.info("开始提取7个目标特征...")
-        feature_result = extract_7features(converted_path)
-        
-        logger.info("开始诊断并计算亚型概率...")
-        diagnosis_result = diagnose(feature_result)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future_feat = executor.submit(extract_7features, converted_path)
+                feature_result = future_feat.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
+
+                future_diag = executor.submit(diagnose, feature_result)
+                diagnosis_result = future_diag.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
+
+        except TimeoutError:
+            return jsonify({
+                "code": 504,
+                "msg": "分析超时，已自动终止"
+            }), 504
         
         total_time = time.time() - total_start
         
