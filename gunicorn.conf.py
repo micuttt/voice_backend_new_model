@@ -2,7 +2,7 @@
 import os
 
 # 绑定端口（Render 会自动分配 $PORT 环境变量）
-bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
+bind = f"0.0.0.0:{os.environ.get('PORT', '10000')}"
 
 # 工作进程数（推荐为 CPU 核心数 * 2 + 1，免费实例用 2 足够）
 workers = 2
