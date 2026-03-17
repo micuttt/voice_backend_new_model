@@ -164,60 +164,80 @@ class ModelManager:
     _model = None
     _preprocessor = None
     _lasso_features = None  # LASSO筛选后的特征（7个）
-    _subtype_classifier = None  # 新增：亚型分类器
+    _subtype_classifier = None
+    _feature_order = None  # 新增：特征顺序缓存
 
     @classmethod
     def load_all(cls):
         """加载模型、预处理器和LASSO筛选后的特征"""
         
-        # 1. 加载LASSO筛选后的特征顺序
+        # 1. 先加载预处理器（现在只包含7个特征的信息）
+        if cls._preprocessor is None:
+            try:
+                cls._preprocessor = joblib.load(CONFIG["PREPROCESSOR_PATH"])
+                logger.info(f"✅ 加载预处理器成功")
+                
+                # 从预处理器获取特征信息
+                small_cols = cls._preprocessor.get('small_cols', [])
+                large_cols = cls._preprocessor.get('large_cols', [])
+                all_features = small_cols + large_cols
+                
+                logger.info(f"📊 预处理器包含 {len(all_features)} 个特征:")
+                logger.info(f"   - 小范围特征 ({len(small_cols)}个): {small_cols}")
+                logger.info(f"   - 大范围特征 ({len(large_cols)}个): {large_cols}")
+                
+                # 缓存特征顺序
+                cls._feature_order = all_features
+                
+            except Exception as e:
+                logger.error(f"❌ 加载预处理器失败: {e}")
+                raise
+
+        # 2. 加载LASSO筛选后的特征顺序（从shap_importance.pkl）
         if cls._lasso_features is None:
             try:
-                # 从shap_importance.pkl读取特征顺序
                 feature_data = joblib.load(CONFIG["FEATURE_ORDER_PATH"])
                 if isinstance(feature_data, pd.DataFrame):
                     cls._lasso_features = feature_data['feature'].tolist()
                 elif isinstance(feature_data, list):
                     cls._lasso_features = feature_data
                 else:
-                    cls._lasso_features = CONFIG["TARGET_FEATURES"]
-                logger.info(f"加载LASSO筛选后的特征成功，共 {len(cls._lasso_features)} 个: {cls._lasso_features}")
-            except Exception as e:
-                logger.error(f"加载特征顺序失败: {e}")
-                cls._lasso_features = CONFIG["TARGET_FEATURES"]
-                logger.info(f"使用默认特征顺序")
-
-        # 2. 加载预处理器（用于标准化）
-        if cls._preprocessor is None:
-            try:
-                cls._preprocessor = joblib.load(CONFIG["PREPROCESSOR_PATH"])
-                logger.info(f"加载预处理器成功")
+                    # 如果加载失败，使用预处理器中的特征顺序
+                    cls._lasso_features = cls._feature_order
                 
-                # 获取所有特征信息（仅用于标准化）
-                small_cols = cls._preprocessor.get('small_cols', [])
-                large_cols = cls._preprocessor.get('large_cols', [])
-                logger.info(f"预处理器包含小范围特征: {len(small_cols)}个，大范围特征: {len(large_cols)}个")
+                logger.info(f"✅ 加载LASSO筛选特征成功，共 {len(cls._lasso_features)} 个")
+                logger.info(f"📌 特征列表: {cls._lasso_features}")
+                
+                # 验证特征一致性
+                if set(cls._lasso_features) != set(cls._feature_order):
+                    logger.warning("⚠️ LASSO特征与预处理器特征不完全一致")
+                    missing = set(cls._lasso_features) - set(cls._feature_order)
+                    extra = set(cls._feature_order) - set(cls._lasso_features)
+                    if missing:
+                        logger.warning(f"   - 缺失特征: {missing}")
+                    if extra:
+                        logger.warning(f"   - 额外特征: {extra}")
                 
             except Exception as e:
-                logger.error(f"加载预处理器失败: {e}")
-                raise
+                logger.error(f"加载特征顺序失败: {e}，使用预处理器特征")
+                cls._lasso_features = cls._feature_order
 
         # 3. 加载模型
         if cls._model is None:
             try:
                 cls._model = joblib.load(CONFIG["MODEL_PATH"])
-                logger.info(f"加载模型成功: {type(cls._model)}")
+                logger.info(f"✅ 加载模型成功: {type(cls._model).__name__}")
                 
                 # 检查模型期望的特征数
                 if hasattr(cls._model, 'n_features_in_'):
-                    logger.info(f"模型期望特征数: {cls._model.n_features_in_}")
-                    if cls._model.n_features_in_ == 7:
-                        logger.info("✅ 模型期望7个特征，与LASSO筛选结果一致")
+                    logger.info(f"📐 模型期望特征数: {cls._model.n_features_in_}")
+                    if cls._model.n_features_in_ == len(cls._lasso_features):
+                        logger.info("✅ 模型特征数与LASSO特征数一致")
                     else:
-                        logger.warning(f"⚠️ 模型期望 {cls._model.n_features_in_} 个特征")
+                        logger.warning(f"⚠️ 模型期望 {cls._model.n_features_in_} 个特征，但LASSO有 {len(cls._lasso_features)} 个")
                         
             except Exception as e:
-                logger.error(f"加载模型失败: {e}")
+                logger.error(f"❌ 加载模型失败: {e}")
                 raise
         
         # 4. 尝试加载亚型分类器（可选）
@@ -225,12 +245,12 @@ class ModelManager:
             try:
                 subtype_model_path = CONFIG.get("SUBTYPE_MODEL_PATH", "./subtype_classifier.pkl")
                 cls._subtype_classifier = joblib.load(subtype_model_path)
-                logger.info("加载亚型预训练分类器成功")
+                logger.info("✅ 加载亚型预训练分类器成功")
             except (FileNotFoundError, KeyError):
-                logger.info("未找到预训练亚型分类器，使用基于文献的规则分类法")
+                logger.info("ℹ️ 未找到预训练亚型分类器，使用基于文献的规则分类法")
                 cls._subtype_classifier = "rule_based"
             except Exception as e:
-                logger.warning(f"加载亚型分类器失败: {e}，使用规则分类法")
+                logger.warning(f"⚠️ 加载亚型分类器失败: {e}，使用规则分类法")
                 cls._subtype_classifier = "rule_based"
 
         return cls._model, cls._preprocessor, cls._lasso_features
@@ -240,48 +260,140 @@ class ModelManager:
         """
         使用训练时的预处理器对7个特征进行标准化
         返回：标准化后的7个特征向量（按LASSO顺序）
+        
+        Args:
+            features_dict: 包含7个特征的字典，如：
+                {'Delta2_mean': 0.5, 'DFA_mean': 0.3, ...}
+        
+        Returns:
+            np.ndarray: 形状为(1, 7)的标准化特征向量
+        """
+        if cls._preprocessor is None or cls._lasso_features is None:
+            cls.load_all()
+        
+        try:
+            # 获取预处理器
+            small_scaler = cls._preprocessor['small']
+            large_scaler = cls._preprocessor['large']
+            small_cols = cls._preprocessor['small_cols']
+            large_cols = cls._preprocessor['large_cols']
+            
+            # 方法1：直接创建7个特征的DataFrame（更简洁）
+            # 注意：预处理器中的特征就是这7个，不需要创建全部特征的DataFrame
+            
+            # 按预处理器中的特征顺序创建DataFrame
+            all_feature_names = small_cols + large_cols
+            features_df = pd.DataFrame(0.0, index=[0], columns=all_feature_names)
+            
+            # 填充特征值
+            for feat_name in all_feature_names:
+                if feat_name in features_dict:
+                    features_df[feat_name] = features_dict[feat_name]
+                else:
+                    logger.warning(f"特征 {feat_name} 不在输入字典中，用0填充")
+            
+            # 分别标准化
+            if small_cols:
+                features_df[small_cols] = small_scaler.transform(features_df[small_cols])
+            
+            if large_cols:
+                features_df[large_cols] = large_scaler.transform(features_df[large_cols])
+            
+            # 方法2：按LASSO顺序重新排列特征
+            # 注意：LASSO顺序可能与预处理器顺序不同
+            lasso_features_scaled = []
+            for feat_name in cls._lasso_features:
+                if feat_name in features_df.columns:
+                    lasso_features_scaled.append(features_df[feat_name].iloc[0])
+                else:
+                    logger.error(f"❌ 关键特征 {feat_name} 不在预处理特征中")
+                    lasso_features_scaled.append(0.0)
+            
+            result = np.array(lasso_features_scaled).reshape(1, -1)
+            logger.debug(f"特征标准化完成: {result[0].tolist()}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ 特征预处理失败: {e}", exc_info=True)
+            # 返回零向量作为fallback
+            return np.zeros((1, len(cls._lasso_features)))
+
+    @classmethod
+    def preprocess_features_efficient(cls, features_dict):
+        """
+        高效版本：直接使用预处理器顺序，不重新排序
+        前提：确保预处理器中的特征顺序与模型训练时一致
+        
+        如果您的模型训练时使用的是预处理器中的特征顺序（small_cols+large_cols），
+        且这个顺序与LASSO顺序一致，可以使用这个高效版本。
         """
         if cls._preprocessor is None:
             cls.load_all()
         
-        # 获取预处理器
-        small_scaler = cls._preprocessor['small']
-        large_scaler = cls._preprocessor['large']
-        small_cols = cls._preprocessor['small_cols']
-        large_cols = cls._preprocessor['large_cols']
+        try:
+            # 获取预处理器
+            small_scaler = cls._preprocessor['small']
+            large_scaler = cls._preprocessor['large']
+            small_cols = cls._preprocessor['small_cols']
+            large_cols = cls._preprocessor['large_cols']
+            
+            # 按预处理器顺序创建特征向量
+            all_features = small_cols + large_cols
+            features_array = np.array([features_dict.get(f, 0.0) for f in all_features]).reshape(1, -1)
+            
+            # 创建DataFrame用于标准化（保持列名）
+            features_df = pd.DataFrame(features_array, columns=all_features)
+            
+            # 分别标准化
+            if small_cols:
+                features_df[small_cols] = small_scaler.transform(features_df[small_cols])
+            if large_cols:
+                features_df[large_cols] = large_scaler.transform(features_df[large_cols])
+            
+            return features_df.values.reshape(1, -1)
+            
+        except Exception as e:
+            logger.error(f"❌ 特征预处理失败: {e}")
+            return np.zeros((1, len(small_cols) + len(large_cols)))
+
+    @classmethod
+    def get_feature_info(cls):
+        """获取特征信息（用于调试）"""
+        if cls._preprocessor is None:
+            cls.load_all()
         
-        # 创建包含所有特征的DataFrame用于标准化
-        all_features = small_cols + large_cols
-        all_features_df = pd.DataFrame(0.0, index=[0], columns=all_features)
+        return {
+            'small_cols': cls._preprocessor.get('small_cols', []),
+            'large_cols': cls._preprocessor.get('large_cols', []),
+            'lasso_features': cls._lasso_features,
+            'total_features': len(cls._preprocessor.get('small_cols', [])) + 
+                             len(cls._preprocessor.get('large_cols', []))
+        }
+
+    @classmethod
+    def validate_features(cls, features_dict):
+        """
+        验证输入特征是否完整
+        返回： (是否有效, 缺失特征列表, 多余特征列表)
+        """
+        if cls._preprocessor is None:
+            cls.load_all()
         
-        # 填充7个特征
-        for feat_name, value in features_dict.items():
-            if feat_name in all_features_df.columns:
-                all_features_df[feat_name] = value
+        expected_features = cls._preprocessor.get('small_cols', []) + \
+                           cls._preprocessor.get('large_cols', [])
         
-        # 分别标准化
-        features_scaled = all_features_df.copy()
+        input_features = set(features_dict.keys())
+        expected_set = set(expected_features)
         
-        if small_cols:
-            existing_small = [c for c in small_cols if c in features_scaled.columns]
-            if existing_small:
-                features_scaled[existing_small] = small_scaler.transform(features_scaled[existing_small])
-                
-        if large_cols:
-            existing_large = [c for c in large_cols if c in features_scaled.columns]
-            if existing_large:
-                features_scaled[existing_large] = large_scaler.transform(features_scaled[existing_large])
+        missing = expected_set - input_features
+        extra = input_features - expected_set
         
-        # 只提取LASSO筛选后的7个特征（标准化后的值）
-        lasso_features_scaled = []
-        for feat_name in cls._lasso_features:
-            if feat_name in features_scaled.columns:
-                lasso_features_scaled.append(features_scaled[feat_name].iloc[0])
-            else:
-                logger.warning(f"特征 {feat_name} 不在预处理器中，用0填充")
-                lasso_features_scaled.append(0.0)
+        is_valid = len(missing) == 0
         
-        return np.array(lasso_features_scaled).reshape(1, -1)
+        if not is_valid:
+            logger.warning(f"特征验证失败: 缺失{len(missing)}个, 多余{len(extra)}个")
+        
+        return is_valid, list(missing), list(extra)
 
 # ===================== 工具函数 =====================
 def sigmoid(x):
@@ -546,10 +658,15 @@ def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
     
     start_time = time.time()
     
-    # 1. 使用预处理器标准化7个特征
+    # 1. 验证特征完整性（可选）
+    is_valid, missing, extra = ModelManager.validate_features(feature_result.feature_dict)
+    if not is_valid:
+        logger.warning(f"特征不完整，缺失: {missing}")
+    
+    # 2. 使用预处理器标准化7个特征
     features_scaled = ModelManager.preprocess_features(feature_result.feature_dict)
     
-    # 2. 预测（features_scaled已经是7个特征）
+    # 3. 预测
     try:
         if hasattr(model, 'predict_proba'):
             pd_prob = float(model.predict_proba(features_scaled)[0, 1])
@@ -557,15 +674,15 @@ def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
             pred = model.predict(features_scaled)[0]
             pd_prob = 0.9 if pred == 1 else 0.1
             
-        logger.info(f"预测成功: pd_prob={pd_prob:.4f}")
+        logger.info(f"✅ 预测成功: pd_prob={pd_prob:.4f}")
     except Exception as e:
-        logger.error(f"预测失败: {e}")
+        logger.error(f"❌ 预测失败: {e}")
         pd_prob = 0.5
     
-    # 3. 计算亚型概率（新增）
+    # 4. 计算亚型概率
     subtype_probs = calculate_subtype_probs(feature_result.feature_dict, pd_prob)
     
-    # 4. 诊断结论
+    # 5. 诊断结论
     diagnosis = "患有PD" if pd_prob >= CONFIG["PD_THRESHOLD"] else "健康"
     if pd_prob >= 0.8:
         risk = "高风险"
@@ -581,7 +698,7 @@ def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
         diagnosis=diagnosis,
         risk=risk,
         features=feature_result.feature_dict,
-        subtype_probs=subtype_probs,  # 新增
+        subtype_probs=subtype_probs,
         feature_warnings=feature_result.feature_warnings,
         processing_time=round(processing_time, 3)
     )
@@ -697,5 +814,5 @@ if __name__ == '__main__':
         logger.error(f"服务启动失败: {e}")
         exit(1)
     
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
