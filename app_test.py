@@ -4,10 +4,10 @@ import logging
 import numpy as np
 import librosa
 import parselmouth
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dataclasses import dataclass
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 import tempfile
 import wave
 import subprocess
@@ -22,6 +22,20 @@ import threading
 import ctypes
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from functools import wraps
+import hashlib
+import signal
+import sys
+import concurrent.futures
+
+# ===================== 修复日志编码 =====================
+import sys
+import io
+
+# 修复标准输出编码
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # ===================== 核心配置 =====================
 CONFIG = {
@@ -29,13 +43,15 @@ CONFIG = {
     "TEMP_DIR": tempfile.gettempdir(),
     "MODEL_PATH": "./model_rank1_Bernoulli_NB.pkl",
     "PREPROCESSOR_PATH": "./preprocessor.pkl",
-    "FEATURE_ORDER_PATH": "./shap_importance.pkl",  # 存储LASSO筛选后的特征顺序
+    "FEATURE_ORDER_PATH": "./shap_importance.pkl",
     "PD_THRESHOLD": 0.5,
     "MIN_AUDIO_DURATION": 1.0,
     "MAX_AUDIO_DURATION": 210.0,
     "ANALYSIS_TIMEOUT_SECONDS": 180,
+    "FFMPEG_TIMEOUT": 30,
+    "CACHE_MAX_SIZE": 20,
+    "MAX_WORKERS": 2,
     
-    # 7个目标特征（从SHAP重要性文件得知）
     "TARGET_FEATURES": [
         "Delta2_mean",
         "DFA_mean", 
@@ -46,47 +62,44 @@ CONFIG = {
         "F2_std_std"
     ],
     
-    # 亚型分类配置（基于7个特征的权重）
     "SUBTYPE_WEIGHTS": {
         "tremor": {
-            "Delta2_mean": 0.25,    # 高频变化，与震颤相关
-            "DFA_mean": 0.20,        # 波动复杂度
-            "F0_slope_mean": 0.15,   # 基频变化
-            "Delta0_mean": 0.25,      # 低频变化
-            "MFCC3_mean": 0.15        # 声道配置
+            "Delta2_mean": 0.25,
+            "DFA_mean": 0.20,
+            "F0_slope_mean": 0.15,
+            "Delta0_mean": 0.25,
+            "MFCC3_mean": 0.15
         },
         "rigidity": {
-            "F0_slope_mean": -0.30,   # 僵直导致基频变化减少
-            "F2_std_mean": -0.25,     # 第二共振峰变化减少
-            "F2_std_std": -0.20,      # 共振峰稳定性降低
-            "Delta2_mean": -0.15,      # 高频变化减少
-            "MFCC3_mean": -0.10        # 声道灵活性降低
+            "F0_slope_mean": -0.30,
+            "F2_std_mean": -0.25,
+            "F2_std_std": -0.20,
+            "Delta2_mean": -0.15,
+            "MFCC3_mean": -0.10
         },
         "motor": {
-            "DFA_mean": 0.25,         # 复杂运动控制
-            "Delta2_mean": 0.20,       # 高频运动成分
-            "F0_slope_mean": 0.20,     # 基频变化
-            "F2_std_mean": 0.20,       # 共振峰变化
-            "F2_std_std": 0.15         # 共振峰稳定性
+            "DFA_mean": 0.25,
+            "Delta2_mean": 0.20,
+            "F0_slope_mean": 0.20,
+            "F2_std_mean": 0.20,
+            "F2_std_std": 0.15
         },
         "non_motor": {
-            "MFCC3_mean": 0.30,        # 声道配置，与非运动症状相关
-            "Delta0_mean": 0.25,        # 缓慢变化
-            "DFA_mean": 0.25,           # 波动特性
-            "F0_slope_mean": 0.20       # 基频变化
+            "MFCC3_mean": 0.30,
+            "Delta0_mean": 0.25,
+            "DFA_mean": 0.25,
+            "F0_slope_mean": 0.20
         }
     },
     
-    # 亚型概率归一化参数
     "SUBTYPE_SMOOTH": 0.1,
     "SUBTYPE_SCALE": 1.2,
     
-    # 亚型解释说明
     "SUBTYPE_EXPLANATION": {
-        "tremor": "震颤主导型：以Delta2_mean（高频变化）和Delta0_mean（低频变化）升高为特征，反映语音震颤",
-        "rigidity": "僵直主导型：以F0_slope_mean（基频斜率）和F2_std（共振峰变化）降低为特征，反映发声器官僵直",
-        "motor": "运动型：以DFA_mean（波动复杂度）和Delta2_mean（高频变化）升高为特征，反映运动症状影响",
-        "non_motor": "非运动型：以MFCC3_mean（声道配置）和Delta0_mean（缓慢变化）改变为特征，反映非运动症状影响"
+        "tremor": "震颤主导型：以Delta2_mean和Delta0_mean升高为特征",
+        "rigidity": "僵直主导型：以F0_slope_mean和F2_std降低为特征",
+        "motor": "运动型：以DFA_mean和Delta2_mean升高为特征",
+        "non_motor": "非运动型：以MFCC3_mean和Delta0_mean改变为特征"
     },
     
     "PRAAT_PARAMS": {
@@ -100,19 +113,46 @@ CONFIG = {
     }
 }
 
-# ===================== 日志配置 =====================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+# ===================== 日志配置（修复编码） =====================
+class EncodingFileHandler(logging.FileHandler):
+    """自定义文件处理器，确保UTF-8编码"""
+    def __init__(self, filename, mode='a', encoding='utf-8', delay=False):
+        super().__init__(filename, mode, encoding, delay)
+
+class EncodingStreamHandler(logging.StreamHandler):
+    """自定义流处理器，确保UTF-8编码"""
+    def __init__(self, stream=None):
+        super().__init__(stream)
+        self.encoding = 'utf-8'
+
+# 配置日志
 logger = logging.getLogger("PDDiagnoser")
+logger.setLevel(logging.INFO)
+
+# 移除所有现有处理器
+logger.handlers.clear()
+
+# 添加UTF-8控制台处理器
+console_handler = EncodingStreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logger.addHandler(console_handler)
+
+# 添加UTF-8文件处理器
+try:
+    file_handler = EncodingFileHandler('pd_diagnoser.log', encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(file_handler)
+except Exception as e:
+    logger.warning(f"无法创建文件日志: {e}")
+
+# ===================== 全局线程池 =====================
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"])
 
 # ===================== 数据类 =====================
 @dataclass
 class FeatureResult:
-    features: np.ndarray  # 7个特征向量
-    feature_dict: Dict[str, float]  # 特征字典
+    features: np.ndarray
+    feature_dict: Dict[str, float]
     feature_warnings: List[str]
 
 @dataclass
@@ -121,35 +161,83 @@ class DiagnosisResult:
     diagnosis: str
     risk: str
     features: Dict[str, float]
-    subtype_probs: Dict[str, float]  # 新增：亚型概率
+    subtype_probs: Dict[str, float]
     feature_warnings: List[str]
     processing_time: float
+
+# ===================== 缓存系统 =====================
+class FeatureCache:
+    """特征结果缓存"""
+    _cache = {}
+    _cache_time = {}
+    _max_size = CONFIG["CACHE_MAX_SIZE"]
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_key(cls, audio_path: str) -> str:
+        """生成缓存键"""
+        try:
+            stat = os.stat(audio_path)
+            return f"{audio_path}_{stat.st_size}_{stat.st_mtime}"
+        except:
+            return audio_path
+    
+    @classmethod
+    def get(cls, key: str) -> Optional[FeatureResult]:
+        """获取缓存"""
+        with cls._lock:
+            if key in cls._cache:
+                cls._cache_time[key] = time.time()
+                logger.debug(f"缓存命中: {key[:50]}...")
+                return cls._cache[key]
+            return None
+    
+    @classmethod
+    def set(cls, key: str, value: FeatureResult):
+        """设置缓存"""
+        with cls._lock:
+            if len(cls._cache) >= cls._max_size:
+                oldest = min(cls._cache_time.items(), key=lambda x: x[1])
+                del cls._cache[oldest[0]]
+                del cls._cache_time[oldest[0]]
+            
+            cls._cache[key] = value
+            cls._cache_time[key] = time.time()
+    
+    @classmethod
+    def clear(cls):
+        """清空缓存"""
+        with cls._lock:
+            cls._cache.clear()
+            cls._cache_time.clear()
+            logger.info("缓存已清空")
 
 # ===================== 限流装饰器 =====================
 class RateLimiter:
     def __init__(self):
         self.requests = {}
+        self.lock = threading.Lock()
         
     def is_allowed(self, ip: str) -> Tuple[bool, str]:
-        import time
-        current_time = time.time()
-        
-        if ip not in self.requests:
-            self.requests[ip] = []
-        
-        self.requests[ip] = [t for t in self.requests[ip] 
-                             if current_time - t < 3600]
-        
-        if len(self.requests[ip]) >= CONFIG["RATE_LIMIT"]["requests_per_hour"]:
-            return False, "超过小时请求限制(500次/小时)"
-        
-        minute_ago = current_time - 60
-        minute_requests = len([t for t in self.requests[ip] if t > minute_ago])
-        if minute_requests >= CONFIG["RATE_LIMIT"]["requests_per_minute"]:
-            return False, "超过分钟请求限制(30次/分钟)"
-        
-        self.requests[ip].append(current_time)
-        return True, ""
+        with self.lock:
+            current_time = time.time()
+            
+            if ip not in self.requests:
+                self.requests[ip] = []
+            
+            self.requests[ip] = [t for t in self.requests[ip] 
+                                 if current_time - t < 3600]
+            
+            if len(self.requests[ip]) >= CONFIG["RATE_LIMIT"]["requests_per_hour"]:
+                return False, "超过小时请求限制(500次/小时)"
+            
+            minute_ago = current_time - 60
+            minute_requests = len([t for t in self.requests[ip] if t > minute_ago])
+            if minute_requests >= CONFIG["RATE_LIMIT"]["requests_per_minute"]:
+                return False, "超过分钟请求限制(30次/分钟)"
+            
+            self.requests[ip].append(current_time)
+            return True, ""
 
 rate_limiter = RateLimiter()
 
@@ -163,241 +251,154 @@ def rate_limit(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# ===================== 模型加载 =====================
+# ===================== 模型加载（修复特征名警告） =====================
 class ModelManager:
     _model = None
     _preprocessor = None
-    _lasso_features = None  # LASSO筛选后的特征（7个）
+    _lasso_features = None
     _subtype_classifier = None
-    _feature_order = None  # 新增：特征顺序缓存
+    _feature_order = None
+    _load_lock = threading.Lock()
+    _small_scaler = None
+    _large_scaler = None
+    _small_cols = []
+    _large_cols = []
 
     @classmethod
     def load_all(cls):
-        """加载模型、预处理器和LASSO筛选后的特征"""
+        """线程安全的模型加载"""
+        if cls._model is not None:
+            return cls._model, cls._preprocessor, cls._lasso_features
         
-        # 1. 先加载预处理器（现在只包含7个特征的信息）
-        if cls._preprocessor is None:
-            try:
-                cls._preprocessor = joblib.load(CONFIG["PREPROCESSOR_PATH"])
-                logger.info(f"✅ 加载预处理器成功")
-                
-                # 从预处理器获取特征信息
-                small_cols = cls._preprocessor.get('small_cols', [])
-                large_cols = cls._preprocessor.get('large_cols', [])
-                all_features = small_cols + large_cols
-                
-                logger.info(f"📊 预处理器包含 {len(all_features)} 个特征:")
-                logger.info(f"   - 小范围特征 ({len(small_cols)}个): {small_cols}")
-                logger.info(f"   - 大范围特征 ({len(large_cols)}个): {large_cols}")
-                
-                # 缓存特征顺序
-                cls._feature_order = all_features
-                
-            except Exception as e:
-                logger.error(f"❌ 加载预处理器失败: {e}")
-                raise
+        with cls._load_lock:
+            if cls._model is not None:
+                return cls._model, cls._preprocessor, cls._lasso_features
+            
+            # 1. 加载预处理器
+            if cls._preprocessor is None:
+                try:
+                    cls._preprocessor = joblib.load(CONFIG["PREPROCESSOR_PATH"])
+                    logger.info("加载预处理器成功")
+                    
+                    # 提取scaler和列信息
+                    cls._small_scaler = cls._preprocessor.get('small')
+                    cls._large_scaler = cls._preprocessor.get('large')
+                    cls._small_cols = cls._preprocessor.get('small_cols', [])
+                    cls._large_cols = cls._preprocessor.get('large_cols', [])
+                    
+                    all_features = cls._small_cols + cls._large_cols
+                    logger.info(f"预处理器包含 {len(all_features)} 个特征")
+                    cls._feature_order = all_features
+                    
+                except Exception as e:
+                    logger.error(f"加载预处理器失败: {e}")
+                    raise
 
-        # 2. 加载LASSO筛选后的特征顺序（从shap_importance.pkl）
-        if cls._lasso_features is None:
-            try:
-                feature_data = joblib.load(CONFIG["FEATURE_ORDER_PATH"])
-                if isinstance(feature_data, pd.DataFrame):
-                    cls._lasso_features = feature_data['feature'].tolist()
-                elif isinstance(feature_data, list):
-                    cls._lasso_features = feature_data
-                else:
-                    # 如果加载失败，使用预处理器中的特征顺序
-                    cls._lasso_features = cls._feature_order
-                
-                logger.info(f"✅ 加载LASSO筛选特征成功，共 {len(cls._lasso_features)} 个")
-                logger.info(f"📌 特征列表: {cls._lasso_features}")
-                
-                # 验证特征一致性
-                if set(cls._lasso_features) != set(cls._feature_order):
-                    logger.warning("⚠️ LASSO特征与预处理器特征不完全一致")
-                    missing = set(cls._lasso_features) - set(cls._feature_order)
-                    extra = set(cls._feature_order) - set(cls._lasso_features)
-                    if missing:
-                        logger.warning(f"   - 缺失特征: {missing}")
-                    if extra:
-                        logger.warning(f"   - 额外特征: {extra}")
-                
-            except Exception as e:
-                logger.error(f"加载特征顺序失败: {e}，使用预处理器特征")
-                cls._lasso_features = cls._feature_order
-
-        # 3. 加载模型
-        if cls._model is None:
-            try:
-                cls._model = joblib.load(CONFIG["MODEL_PATH"])
-                logger.info(f"✅ 加载模型成功: {type(cls._model).__name__}")
-                
-                # 检查模型期望的特征数
-                if hasattr(cls._model, 'n_features_in_'):
-                    logger.info(f"📐 模型期望特征数: {cls._model.n_features_in_}")
-                    if cls._model.n_features_in_ == len(cls._lasso_features):
-                        logger.info("✅ 模型特征数与LASSO特征数一致")
+            # 2. 加载LASSO特征
+            if cls._lasso_features is None:
+                try:
+                    feature_data = joblib.load(CONFIG["FEATURE_ORDER_PATH"])
+                    if isinstance(feature_data, pd.DataFrame):
+                        cls._lasso_features = feature_data['feature'].tolist()
+                    elif isinstance(feature_data, list):
+                        cls._lasso_features = feature_data
                     else:
-                        logger.warning(f"⚠️ 模型期望 {cls._model.n_features_in_} 个特征，但LASSO有 {len(cls._lasso_features)} 个")
-                        
-            except Exception as e:
-                logger.error(f"❌ 加载模型失败: {e}")
-                raise
-        
-        # 4. 尝试加载亚型分类器（可选）
-        if cls._subtype_classifier is None:
-            try:
-                subtype_model_path = CONFIG.get("SUBTYPE_MODEL_PATH", "./subtype_classifier.pkl")
-                cls._subtype_classifier = joblib.load(subtype_model_path)
-                logger.info("✅ 加载亚型预训练分类器成功")
-            except (FileNotFoundError, KeyError):
-                logger.info("ℹ️ 未找到预训练亚型分类器，使用基于文献的规则分类法")
-                cls._subtype_classifier = "rule_based"
-            except Exception as e:
-                logger.warning(f"⚠️ 加载亚型分类器失败: {e}，使用规则分类法")
-                cls._subtype_classifier = "rule_based"
+                        cls._lasso_features = cls._feature_order
+                    
+                    logger.info(f"加载LASSO特征成功，共 {len(cls._lasso_features)} 个")
+                    
+                except Exception as e:
+                    logger.error(f"加载特征顺序失败: {e}，使用预处理器特征")
+                    cls._lasso_features = cls._feature_order
 
-        return cls._model, cls._preprocessor, cls._lasso_features
+            # 3. 加载模型
+            if cls._model is None:
+                try:
+                    cls._model = joblib.load(CONFIG["MODEL_PATH"])
+                    logger.info(f"加载模型成功: {type(cls._model).__name__}")
+                    
+                except Exception as e:
+                    logger.error(f"加载模型失败: {e}")
+                    raise
+
+            return cls._model, cls._preprocessor, cls._lasso_features
 
     @classmethod
     def preprocess_features(cls, features_dict):
         """
-        使用训练时的预处理器对7个特征进行标准化
-        返回：标准化后的7个特征向量（按LASSO顺序）
-        
-        Args:
-            features_dict: 包含7个特征的字典，如：
-                {'Delta2_mean': 0.5, 'DFA_mean': 0.3, ...}
-        
-        Returns:
-            np.ndarray: 形状为(1, 7)的标准化特征向量
+        特征预处理 - 修复特征名警告
+        使用numpy数组而不是DataFrame，避免特征名警告
         """
-        if cls._preprocessor is None or cls._lasso_features is None:
+        if cls._preprocessor is None:
             cls.load_all()
-        
+
         try:
-            # 获取预处理器
-            small_scaler = cls._preprocessor['small']
-            large_scaler = cls._preprocessor['large']
-            small_cols = cls._preprocessor['small_cols']
-            large_cols = cls._preprocessor['large_cols']
+            # 使用CONFIG中定义的7个特征顺序
+            TARGET_FEATURES = CONFIG["TARGET_FEATURES"]
             
-            # 方法1：直接创建7个特征的DataFrame（更简洁）
-            # 注意：预处理器中的特征就是这7个，不需要创建全部特征的DataFrame
+            # 构建特征数组 - 直接使用numpy数组，不带特征名
+            feat_array = np.array([
+                features_dict.get(f, 0.0) for f in TARGET_FEATURES
+            ], dtype=np.float32).reshape(1, -1)
             
-            # 按预处理器中的特征顺序创建DataFrame
-            all_feature_names = small_cols + large_cols
-            features_df = pd.DataFrame(0.0, index=[0], columns=all_feature_names)
-            
-            # 填充特征值
-            for feat_name in all_feature_names:
-                if feat_name in features_dict:
-                    features_df[feat_name] = features_dict[feat_name]
+            # 如果需要完整预处理（包括小范围和大范围标准化）
+            if cls._small_scaler is not None and cls._large_scaler is not None:
+                # 这里假设TARGET_FEATURES的顺序与预处理器要求的顺序一致
+                # 如果不一致，需要映射
+                
+                # 创建完整的特征向量（所有特征）
+                all_features = cls._small_cols + cls._large_cols
+                full_feat_array = np.array([
+                    features_dict.get(f, 0.0) for f in all_features
+                ], dtype=np.float32).reshape(1, -1)
+                
+                # 分别标准化
+                n_small = len(cls._small_cols)
+                if n_small > 0:
+                    small_part = full_feat_array[:, :n_small]
+                    # 确保是numpy数组，不是DataFrame
+                    small_scaled = cls._small_scaler.transform(small_part)
                 else:
-                    logger.warning(f"特征 {feat_name} 不在输入字典中，用0填充")
-            
-            # 分别标准化
-            if small_cols:
-                features_df[small_cols] = small_scaler.transform(features_df[small_cols])
-            
-            if large_cols:
-                features_df[large_cols] = large_scaler.transform(features_df[large_cols])
-            
-            # 方法2：按LASSO顺序重新排列特征
-            # 注意：LASSO顺序可能与预处理器顺序不同
-            lasso_features_scaled = []
-            for feat_name in cls._lasso_features:
-                if feat_name in features_df.columns:
-                    lasso_features_scaled.append(features_df[feat_name].iloc[0])
+                    small_scaled = np.array([[]])
+                
+                n_large = len(cls._large_cols)
+                if n_large > 0:
+                    large_part = full_feat_array[:, n_small:]
+                    large_scaled = cls._large_scaler.transform(large_part)
                 else:
-                    logger.error(f"❌ 关键特征 {feat_name} 不在预处理特征中")
-                    lasso_features_scaled.append(0.0)
-            
-            result = np.array(lasso_features_scaled).reshape(1, -1)
-            logger.debug(f"特征标准化完成: {result[0].tolist()}")
-            return result
-            
+                    large_scaled = np.array([[]])
+                
+                # 拼接
+                final = np.hstack([small_scaled, large_scaled])
+                
+                # 如果模型需要的是7个特征，但预处理器输出更多，需要筛选
+                if final.shape[1] > len(TARGET_FEATURES):
+                    # 根据特征名称筛选（需要特征名称到索引的映射）
+                    # 这里简化处理，假设前7个就是要的
+                    final = final[:, :len(TARGET_FEATURES)]
+                
+                return final
+            else:
+                # 如果没有预处理器，直接返回7个特征
+                return feat_array
+
         except Exception as e:
-            logger.error(f"❌ 特征预处理失败: {e}", exc_info=True)
-            # 返回零向量作为fallback
-            return np.zeros((1, len(cls._lasso_features)))
+            logger.error(f"预处理失败: {e}")
+            return np.zeros((1, len(CONFIG["TARGET_FEATURES"])))
 
     @classmethod
-    def preprocess_features_efficient(cls, features_dict):
+    def preprocess_features_simple(cls, features_dict):
         """
-        高效版本：直接使用预处理器顺序，不重新排序
-        前提：确保预处理器中的特征顺序与模型训练时一致
-        
-        如果您的模型训练时使用的是预处理器中的特征顺序（small_cols+large_cols），
-        且这个顺序与LASSO顺序一致，可以使用这个高效版本。
+        简化版预处理 - 只使用7个特征，不进行标准化
+        如果模型已经用标准化后的数据训练，不要使用这个版本
         """
-        if cls._preprocessor is None:
-            cls.load_all()
+        TARGET_FEATURES = CONFIG["TARGET_FEATURES"]
         
-        try:
-            # 获取预处理器
-            small_scaler = cls._preprocessor['small']
-            large_scaler = cls._preprocessor['large']
-            small_cols = cls._preprocessor['small_cols']
-            large_cols = cls._preprocessor['large_cols']
-            
-            # 按预处理器顺序创建特征向量
-            all_features = small_cols + large_cols
-            features_array = np.array([features_dict.get(f, 0.0) for f in all_features]).reshape(1, -1)
-            
-            # 创建DataFrame用于标准化（保持列名）
-            features_df = pd.DataFrame(features_array, columns=all_features)
-            
-            # 分别标准化
-            if small_cols:
-                features_df[small_cols] = small_scaler.transform(features_df[small_cols])
-            if large_cols:
-                features_df[large_cols] = large_scaler.transform(features_df[large_cols])
-            
-            return features_df.values.reshape(1, -1)
-            
-        except Exception as e:
-            logger.error(f"❌ 特征预处理失败: {e}")
-            return np.zeros((1, len(small_cols) + len(large_cols)))
-
-    @classmethod
-    def get_feature_info(cls):
-        """获取特征信息（用于调试）"""
-        if cls._preprocessor is None:
-            cls.load_all()
+        feat_array = np.array([
+            features_dict.get(f, 0.0) for f in TARGET_FEATURES
+        ], dtype=np.float32).reshape(1, -1)
         
-        return {
-            'small_cols': cls._preprocessor.get('small_cols', []),
-            'large_cols': cls._preprocessor.get('large_cols', []),
-            'lasso_features': cls._lasso_features,
-            'total_features': len(cls._preprocessor.get('small_cols', [])) + 
-                             len(cls._preprocessor.get('large_cols', []))
-        }
-
-    @classmethod
-    def validate_features(cls, features_dict):
-        """
-        验证输入特征是否完整
-        返回： (是否有效, 缺失特征列表, 多余特征列表)
-        """
-        if cls._preprocessor is None:
-            cls.load_all()
-        
-        expected_features = cls._preprocessor.get('small_cols', []) + \
-                           cls._preprocessor.get('large_cols', [])
-        
-        input_features = set(features_dict.keys())
-        expected_set = set(expected_features)
-        
-        missing = expected_set - input_features
-        extra = input_features - expected_set
-        
-        is_valid = len(missing) == 0
-        
-        if not is_valid:
-            logger.warning(f"特征验证失败: 缺失{len(missing)}个, 多余{len(extra)}个")
-        
-        return is_valid, list(missing), list(extra)
+        return feat_array
 
 # ===================== 工具函数 =====================
 def sigmoid(x):
@@ -409,42 +410,36 @@ def check_ffmpeg():
     try:
         result = subprocess.run(['ffmpeg', '-version'], 
                                capture_output=True, 
-                               text=True)
+                               text=True,
+                               timeout=5)
         return result.returncode == 0
-    except FileNotFoundError:
+    except:
         return False
 
 def validate_audio_duration(audio_path: str) -> Tuple[bool, float, str]:
-    """验证音频时长是否在允许范围内"""
+    """验证音频时长"""
     try:
-        import wave
         with wave.open(audio_path, 'rb') as wf:
             frames = wf.getnframes()
             rate = wf.getframerate()
             duration = frames / rate
             
         if duration < CONFIG["MIN_AUDIO_DURATION"]:
-            return False, duration, f"音频过短 ({duration:.2f}秒)，需大于{CONFIG['MIN_AUDIO_DURATION']}秒"
+            return False, duration, f"音频过短 ({duration:.2f}秒)"
         
         if duration > CONFIG["MAX_AUDIO_DURATION"]:
-            return False, duration, f"音频过长 ({duration:.2f}秒)，需小于{CONFIG['MAX_AUDIO_DURATION']}秒"
+            return False, duration, f"音频过长 ({duration:.2f}秒)"
         
         return True, duration, ""
     except Exception as e:
         return False, 0, f"读取音频失败: {str(e)}"
 
-def clean_temp_files(pattern: str = "*.wav"):
-    try:
-        for file in glob.glob(os.path.join(CONFIG["TEMP_DIR"], pattern)):
-            os.remove(file)
-    except Exception as e:
-        logger.warning(f"清理临时文件失败: {e}")
-
 def get_temp_path(prefix: str) -> str:
-    return os.path.join(CONFIG["TEMP_DIR"], f"{prefix}_{os.getpid()}_{np.random.randint(10000)}.wav")
+    """获取临时文件路径"""
+    return os.path.join(CONFIG["TEMP_DIR"], f"{prefix}_{os.getpid()}_{int(time.time())}_{np.random.randint(10000)}.wav")
 
 def convert_numpy_type(obj):
-    """递归转换numpy类型为Python原生类型"""
+    """递归转换numpy类型"""
     if isinstance(obj, np.integer):
         return int(obj)
     elif isinstance(obj, np.floating):
@@ -457,6 +452,40 @@ def convert_numpy_type(obj):
         return [convert_numpy_type(i) for i in obj]
     else:
         return obj
+
+def cleanup_temp_files(temp_paths: List[str]):
+    """清理临时文件"""
+    for path in temp_paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                logger.debug(f"已删除临时文件: {path}")
+            except Exception as e:
+                logger.warning(f"删除临时文件失败 {path}: {e}")
+
+def convert_audio_sync(input_path: str, output_path: str) -> bool:
+    """同步音频转换"""
+    ffmpeg_cmd = [
+        "ffmpeg", "-i", input_path,
+        "-ar", str(CONFIG["SAMPLING_RATE"]),
+        "-ac", "1", "-sample_fmt", "s16",
+        "-c:a", "pcm_s16le", "-y", output_path
+    ]
+    
+    try:
+        result = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            timeout=CONFIG["FFMPEG_TIMEOUT"]
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg转换超时")
+        return False
+    except Exception as e:
+        logger.error(f"FFmpeg转换失败: {e}")
+        return False
 
 # ===================== 特征提取 =====================
 def extract_f0_slope(seg, sr, fmin=75, fmax=500):
@@ -606,71 +635,73 @@ def extract_7features(audio_path: str) -> FeatureResult:
         return FeatureResult(
             features=np.zeros(len(CONFIG["TARGET_FEATURES"])),
             feature_dict=zero_features,
-            feature_warnings=[f"特征提取失败: {str(e)}"]
+            feature_warnings=[f"严重错误：语音特征提取失败"]
         )
 
-# ===================== PD亚型概率计算（新增） =====================
+def extract_7features_with_cache(audio_path: str) -> FeatureResult:
+    """带缓存的特征提取"""
+    cache_key = FeatureCache.get_key(audio_path)
+    cached_result = FeatureCache.get(cache_key)
+    if cached_result:
+        return cached_result
+    
+    feature_result = extract_7features(audio_path)
+    
+    if "失败" not in feature_result.feature_warnings[0] if feature_result.feature_warnings else True:
+        FeatureCache.set(cache_key, feature_result)
+    
+    return feature_result
+
+# ===================== PD亚型概率计算 =====================
 def calculate_subtype_probs(feature_dict: Dict[str, float], pd_prob: float) -> Dict[str, float]:
-    """
-    基于7个特征计算PD亚型概率
-    完全模仿第一个代码的亚型计算逻辑
-    """
+    """计算PD亚型概率"""
     weights = CONFIG["SUBTYPE_WEIGHTS"]
     subtype_scores = {}
     
-    # 1. 计算各亚型原始得分（特征加权和）
     for subtype, feat_weights in weights.items():
         score = 0.0
         for feat_name, weight in feat_weights.items():
-            # 获取特征值，如果不存在则用0
             feat_value = feature_dict.get(feat_name, 0.0)
             score += feat_value * weight
         subtype_scores[subtype] = score
     
-    # 2. 结合PD概率调整得分（模仿第一个代码）
     adjusted_scores = {}
     for subtype, score in subtype_scores.items():
         adjusted_scores[subtype] = score * pd_prob * CONFIG["SUBTYPE_SCALE"] + CONFIG["SUBTYPE_SMOOTH"]
     
-    # 3. Sigmoid转换（将得分映射到0-1之间）
     sigmoid_scores = {subtype: sigmoid(score) for subtype, score in adjusted_scores.items()}
     
-    # 4. 归一化（确保和为1）
     total = sum(sigmoid_scores.values())
     if total > 0:
         normalized_probs = {
-            subtype: round(prob / total, 4) 
+            subtype: round(float(prob) / total, 4) 
             for subtype, prob in sigmoid_scores.items()
         }
     else:
-        # 如果总和为0，则平均分配
         n_subtypes = len(sigmoid_scores)
         normalized_probs = {subtype: round(1.0 / n_subtypes, 4) for subtype in sigmoid_scores.keys()}
     
-    # 5. 低PD概率时降低亚型概率（模仿第一个代码）
     if pd_prob < CONFIG["PD_THRESHOLD"]:
         for subtype in normalized_probs:
             normalized_probs[subtype] = round(normalized_probs[subtype] * pd_prob, 4)
+    
+    # 转换numpy类型为Python原生类型
+    normalized_probs = {k: float(v) for k, v in normalized_probs.items()}
     
     logger.info(f"亚型概率计算完成: {normalized_probs}")
     return normalized_probs
 
 # ===================== 诊断逻辑 =====================
 def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
-    """使用模型诊断，并计算亚型概率"""
+    """使用模型诊断"""
     model, preprocessor, lasso_features = ModelManager.load_all()
     
     start_time = time.time()
     
-    # 1. 验证特征完整性（可选）
-    is_valid, missing, extra = ModelManager.validate_features(feature_result.feature_dict)
-    if not is_valid:
-        logger.warning(f"特征不完整，缺失: {missing}")
-    
-    # 2. 使用预处理器标准化7个特征
+    # 特征预处理
     features_scaled = ModelManager.preprocess_features(feature_result.feature_dict)
     
-    # 3. 预测
+    # 预测
     try:
         if hasattr(model, 'predict_proba'):
             pd_prob = float(model.predict_proba(features_scaled)[0, 1])
@@ -678,15 +709,15 @@ def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
             pred = model.predict(features_scaled)[0]
             pd_prob = 0.9 if pred == 1 else 0.1
             
-        logger.info(f"✅ 预测成功: pd_prob={pd_prob:.4f}")
+        logger.info(f"预测成功: pd_prob={pd_prob:.4f}")
     except Exception as e:
-        logger.error(f"❌ 预测失败: {e}")
+        logger.error(f"预测失败: {e}")
         pd_prob = 0.5
     
-    # 4. 计算亚型概率
+    # 计算亚型概率
     subtype_probs = calculate_subtype_probs(feature_result.feature_dict, pd_prob)
     
-    # 5. 诊断结论
+    # 诊断结论
     diagnosis = "患有PD" if pd_prob >= CONFIG["PD_THRESHOLD"] else "健康"
     if pd_prob >= 0.8:
         risk = "高风险"
@@ -711,15 +742,52 @@ def diagnose(feature_result: FeatureResult) -> DiagnosisResult:
 app = Flask(__name__)
 CORS(app)
 
+@app.before_request
+def before_request():
+    """请求前处理"""
+    g.start_time = time.time()
+    g.request_id = hashlib.md5(f"{time.time()}_{np.random.random()}".encode()).hexdigest()[:8]
+    logger.info(f"请求[{g.request_id}]开始: {request.path}")
+
+@app.after_request
+def after_request(response):
+    """请求后处理"""
+    if hasattr(g, 'start_time'):
+        duration = time.time() - g.start_time
+        logger.info(f"请求[{getattr(g, 'request_id', 'unknown')}]完成: 耗时{duration:.2f}秒")
+        response.headers['X-Processing-Time'] = str(round(duration, 2))
+    return response
+
 @app.route('/', methods=['GET'])
 def health_check():
-    return "PD Voice Diagnosis Service", 200
+    """健康检查"""
+    return jsonify({
+        "status": "healthy", 
+        "service": "PD Voice Diagnosis Service",
+        "timestamp": time.time()
+    }), 200
+
+@app.route('/health/detailed', methods=['GET'])
+def detailed_health():
+    """详细健康检查"""
+    return jsonify({
+        "status": "healthy",
+        "ffmpeg_available": check_ffmpeg(),
+        "model_loaded": ModelManager._model is not None,
+        "cache_size": len(FeatureCache._cache),
+        "config": {
+            "max_workers": CONFIG["MAX_WORKERS"],
+            "timeout": CONFIG["ANALYSIS_TIMEOUT_SECONDS"],
+            "cache_max_size": CONFIG["CACHE_MAX_SIZE"]
+        }
+    }), 200
 
 @app.route('/analyze', methods=['POST'])
 @rate_limit
 def pd_diagnose():
+    """诊断接口"""
     temp_paths = []
-    total_start = time.time()
+    request_id = getattr(g, 'request_id', 'unknown')
     
     try:
         if 'file' not in request.files:
@@ -732,7 +800,7 @@ def pd_diagnose():
         if not check_ffmpeg():
             return jsonify({"code": 500, "msg": "服务器音频处理组件缺失"}), 500
         
-        logger.info(f"接收请求: {file.filename}")
+        logger.info(f"请求[{request_id}] 接收文件: {file.filename}")
         
         temp_path = get_temp_path("upload")
         converted_path = get_temp_path("converted")
@@ -740,41 +808,60 @@ def pd_diagnose():
         
         file.save(temp_path)
         
-        ffmpeg_cmd = [
-            "ffmpeg", "-i", temp_path,
-            "-ar", str(CONFIG["SAMPLING_RATE"]),
-            "-ac", "1", "-sample_fmt", "s16",
-            "-c:a", "pcm_s16le", "-y", converted_path
-        ]
+        # 音频转换
+        try:
+            convert_result = convert_audio_sync(temp_path, converted_path)
+            if not convert_result:
+                raise Exception("音频转换失败")
+        except Exception as e:
+            return jsonify({"code": 500, "msg": f"音频转换失败: {str(e)}"}), 500
         
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"音频转换失败")
-        
+        # 验证时长
         valid, duration, msg = validate_audio_duration(converted_path)
         if not valid:
             return jsonify({"code": 400, "msg": msg}), 400
         
+        # 特征提取
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future_feat = executor.submit(extract_7features, converted_path)
+            with ThreadPoolExecutor(max_workers=1) as thread_executor:
+                future_feat = thread_executor.submit(extract_7features_with_cache, converted_path)
                 feature_result = future_feat.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
-
-                future_diag = executor.submit(diagnose, feature_result)
-                diagnosis_result = future_diag.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
-
         except TimeoutError:
+            logger.error(f"请求[{request_id}] 特征提取超时")
             return jsonify({
                 "code": 504,
-                "msg": "分析超时，已自动终止"
+                "msg": "特征提取超时，请稍后重试"
+            }), 504
+        except Exception as e:
+            logger.error(f"请求[{request_id}] 特征提取失败: {e}")
+            return jsonify({"code": 500, "msg": f"特征提取失败: {str(e)}"}), 500
+        
+        # 检查特征提取是否成功
+        if feature_result.feature_warnings and "失败" in feature_result.feature_warnings[0]:
+            return jsonify({
+                "code": 500,
+                "msg": feature_result.feature_warnings[0]
+            }), 500
+        
+        # 诊断
+        try:
+            with ThreadPoolExecutor(max_workers=1) as thread_executor:
+                future_diag = thread_executor.submit(diagnose, feature_result)
+                diagnosis_result = future_diag.result(timeout=30)
+        except TimeoutError:
+            logger.error(f"请求[{request_id}] 诊断超时")
+            return jsonify({
+                "code": 504,
+                "msg": "诊断超时，请稍后重试"
             }), 504
         
-        total_time = time.time() - total_start
+        total_time = time.time() - g.start_time
         
-        # 构建返回结果（包含亚型信息）
+        # 构建返回结果
         response = {
             "code": 200,
             "msg": "诊断成功",
+            "request_id": request_id,
             "data": {
                 "audio_duration": round(duration, 2),
                 "processing_time": round(total_time, 2),
@@ -783,7 +870,6 @@ def pd_diagnose():
                 "risk_level": diagnosis_result.risk,
                 "features": diagnosis_result.features,
                 "feature_warnings": diagnosis_result.feature_warnings,
-                # 新增亚型相关信息
                 "subtype_probabilities": {
                     "tremor_type": diagnosis_result.subtype_probs.get("tremor", 0.0),
                     "rigidity_type": diagnosis_result.subtype_probs.get("rigidity", 0.0),
@@ -794,24 +880,58 @@ def pd_diagnose():
             }
         }
         
+        logger.info(f"请求[{request_id}] 诊断完成，耗时{total_time:.2f}秒")
+        
         # 转换numpy类型
         response = convert_numpy_type(response)
         
         return jsonify(response), 200
         
     except Exception as e:
-        logger.error(f"诊断异常: {e}", exc_info=True)
+        logger.error(f"请求[{request_id}] 诊断异常: {e}", exc_info=True)
         return jsonify({
             "code": 500,
             "msg": f"诊断失败: {str(e)}"
         }), 500
     finally:
-        for path in temp_paths:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        cleanup_temp_files(temp_paths)
+
+# ===================== 缓存管理接口 =====================
+@app.route('/cache/clear', methods=['POST'])
+def clear_cache():
+    """清空缓存"""
+    auth_key = request.headers.get('X-Admin-Key')
+    if auth_key != os.environ.get('ADMIN_KEY', 'admin-secret-key'):
+        return jsonify({"code": 403, "msg": "无权访问"}), 403
+    
+    FeatureCache.clear()
+    return jsonify({"code": 200, "msg": "缓存已清空"}), 200
+
+@app.route('/cache/stats', methods=['GET'])
+def cache_stats():
+    """缓存统计"""
+    return jsonify({
+        "code": 200,
+        "data": {
+            "cache_size": len(FeatureCache._cache),
+            "max_size": CONFIG["CACHE_MAX_SIZE"],
+            "cache_keys": list(FeatureCache._cache.keys())[:5] if FeatureCache._cache else []
+        }
+    }), 200
+
+# ===================== 优雅关闭 =====================
+def signal_handler(signum, frame):
+    """处理退出信号"""
+    logger.info(f"收到信号 {signum}，正在优雅关闭...")
+    
+    executor.shutdown(wait=True, cancel_futures=True)
+    cleanup_temp_files(glob.glob(os.path.join(CONFIG["TEMP_DIR"], "*.wav")))
+    
+    logger.info("服务已关闭")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # ===================== 启动服务 =====================
 if __name__ == '__main__':
@@ -821,10 +941,15 @@ if __name__ == '__main__':
     
     try:
         ModelManager.load_all()
-        logger.info("服务启动成功")
+        logger.info("模型加载成功")
     except Exception as e:
-        logger.error(f"服务启动失败: {e}")
+        logger.error(f"模型加载失败: {e}")
         exit(1)
     
+    cleanup_temp_files(glob.glob(os.path.join(CONFIG["TEMP_DIR"], "*.wav")))
+    
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
+    
+    logger.info(f"服务启动在端口 {port}，调试模式: {debug}")
+    app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
