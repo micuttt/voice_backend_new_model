@@ -367,18 +367,6 @@ def sigmoid(x):
     """Sigmoid函数"""
     return 1 / (1 + np.exp(-x))
 
-def check_ffmpeg():
-    """检查ffmpeg是否可用"""
-    try:
-        result = subprocess.run(['ffmpeg', '-version'], 
-                               capture_output=True, 
-                               text=True,
-                               timeout=20)
-        return result.returncode == 0
-    except Exception as e:
-        logger.error(f"FFmpeg检查失败: {e}")
-        return False
-
 def validate_audio_duration(audio_path: str) -> Tuple[bool, float, str]:
     """验证音频时长"""
     try:
@@ -865,7 +853,6 @@ def detailed_health():
     """详细健康检查"""
     return jsonify({
         "status": "healthy",
-        "ffmpeg_available": check_ffmpeg(),
         "model_loaded": ModelManager._model is not None,
         "config": {
             "max_workers": CONFIG["MAX_WORKERS"],
@@ -892,10 +879,6 @@ def pd_diagnose():
             logger.warning(f"请求[{request_id}] 未选择音频文件")
             return jsonify({"code": 400, "msg": "未选择音频文件"}), 400
         
-        if not check_ffmpeg():
-            logger.error(f"请求[{request_id}] FFmpeg不可用")
-            return jsonify({"code": 500, "msg": "服务器音频处理组件缺失"}), 500
-        
         logger.info(f"请求[{request_id}] 接收文件: {file.filename}, 大小: {file.content_length if file.content_length else '未知'}字节")
         
         temp_path = get_temp_path("upload")
@@ -908,7 +891,7 @@ def pd_diagnose():
          # 音频转换
         logger.info(f"请求[{request_id}] 开始音频转换")
         try:
-            convert_result = convert_audio_sync(temp_path, converted_path, request_id)  # 👈 使用修改后的函数
+            convert_result = convert_audio_sync(temp_path, converted_path, request_id)
             if not convert_result:
                 raise Exception("音频转换失败")
             logger.info(f"请求[{request_id}] 音频转换完成: {converted_path}")
@@ -1053,10 +1036,6 @@ if __name__ == '__main__':
     print("="*60)
     print("PD语音诊断服务启动中...")
     print("="*60)
-    
-    if not check_ffmpeg():
-        logger.error("ffmpeg未安装，请先安装ffmpeg")
-        exit(1)
     
     try:
         ModelManager.load_all()
