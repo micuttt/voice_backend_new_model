@@ -418,52 +418,19 @@ def cleanup_temp_files(temp_paths: List[str]):
                 logger.warning(f"删除临时文件失败 {path}: {e}")
 
 def convert_audio_sync(input_path: str, output_path: str, request_id="unknown") -> bool:
-    """
-    【稳定修复版】音频转换：使用 ffmpeg 转为 16k 单声道 pcm_s16le
-    自带超时、错误捕获、日志输出
-    """
     try:
-        # 强制删除已存在的输出文件，避免占用
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-        # 稳定的 ffmpeg 命令
-        cmd = [
-            "ffmpeg",
-            "-i", input_path,
-            "-ar", str(CONFIG["SAMPLING_RATE"]),
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            "-y",
-            output_path
-        ]
-
-        # 执行并捕获错误（关键修复）
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=CONFIG["FFMPEG_TIMEOUT"]  # 30秒，足够
-        )
-
-        # 转换失败时输出错误日志（超级重要）
-        if result.returncode != 0:
-            err = result.stderr.decode('utf-8', errors='ignore')
-            logger.error(f"请求[{request_id}] ffmpeg错误: {err[:500]}")
-            return False
-
-        # 检查文件是否真的生成
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            logger.error(f"请求[{request_id}] 转换后文件为空")
-            return False
-
-        return True
-
-    except subprocess.TimeoutExpired:
-        logger.error(f"请求[{request_id}] ffmpeg 执行超时")
-        return False
+        cmd = ["ffmpeg", "-i", input_path, "-ar", "16000", "-ac", "1", "-y", output_path]
+        # 使用 context manager 确保进程关闭
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            try:
+                proc.communicate(timeout=CONFIG["FFMPEG_TIMEOUT"])
+                return proc.returncode == 0
+            except subprocess.TimeoutExpired:
+                proc.kill() # 只杀当前的这个进程
+                logger.error(f"请求[{request_id}] ffmpeg 超时")
+                return False
     except Exception as e:
-        logger.error(f"请求[{request_id}] ffmpeg 异常: {str(e)}")
+        logger.error(f"转换错误: {e}")
         return False
 # ===================== 修正后的特征提取函数 =====================
 
@@ -984,13 +951,6 @@ def pd_diagnose():
         }), 500
     finally:
         cleanup_temp_files(temp_paths)
-        try:
-            subprocess.run(['pkill', '-f', 'ffmpeg'], 
-                          capture_output=True, 
-                          timeout=5)
-            logger.debug(f"请求[{request_id}] 已清理所有ffmpeg进程")
-        except:
-            pass
 
 # ===================== 调试接口 =====================
 @app.route('/debug/feature/<path:filename>', methods=['GET'])
