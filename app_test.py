@@ -50,7 +50,6 @@ CONFIG = {
     "MAX_AUDIO_DURATION": 210.0,
     "ANALYSIS_TIMEOUT_SECONDS": 180,
     "FFMPEG_TIMEOUT": 30,
-    "CACHE_MAX_SIZE": 3,
     "MAX_WORKERS": 1,
     
     # ⚠️ 新的7个目标特征（严格按照LASSO筛选后的顺序）
@@ -140,8 +139,6 @@ console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(level
 console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
-
-
 # ===================== 全局线程池 =====================
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"])
 
@@ -163,53 +160,6 @@ class DiagnosisResult:
     feature_warnings: List[str]
     processing_time: float
     raw_features_scaled: np.ndarray = None  # 新增：保存标准化后的特征
-
-# ===================== 缓存系统 =====================
-class FeatureCache:
-    """特征结果缓存"""
-    _cache = {}
-    _cache_time = {}
-    _max_size = CONFIG["CACHE_MAX_SIZE"]
-    _lock = threading.Lock()
-    
-    @classmethod
-    def get_key(cls, audio_path: str) -> str:
-        """生成缓存键"""
-        try:
-            stat = os.stat(audio_path)
-            return f"{audio_path}_{stat.st_size}_{stat.st_mtime}"
-        except:
-            return audio_path
-    
-    @classmethod
-    def get(cls, key: str) -> Optional[FeatureResult]:
-        """获取缓存"""
-        with cls._lock:
-            if key in cls._cache:
-                cls._cache_time[key] = time.time()
-                logger.debug(f"缓存命中: {key[:50]}...")
-                return cls._cache[key]
-            return None
-    
-    @classmethod
-    def set(cls, key: str, value: FeatureResult):
-        """设置缓存"""
-        with cls._lock:
-            if len(cls._cache) >= cls._max_size:
-                oldest = min(cls._cache_time.items(), key=lambda x: x[1])
-                del cls._cache[oldest[0]]
-                del cls._cache_time[oldest[0]]
-            
-            cls._cache[key] = value
-            cls._cache_time[key] = time.time()
-    
-    @classmethod
-    def clear(cls):
-        """清空缓存"""
-        with cls._lock:
-            cls._cache.clear()
-            cls._cache_time.clear()
-            logger.info("缓存已清空")
 
 # ===================== 限流装饰器 =====================
 class RateLimiter:
@@ -423,7 +373,7 @@ def check_ffmpeg():
         result = subprocess.run(['ffmpeg', '-version'], 
                                capture_output=True, 
                                text=True,
-                               timeout=50)
+                               timeout=20)
         return result.returncode == 0
     except Exception as e:
         logger.error(f"FFmpeg检查失败: {e}")
@@ -764,23 +714,6 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
             raw_segment_features=[]
         )
 
-def extract_7features_with_cache(audio_path: str, request_id="unknown") -> FeatureResult:
-    """带缓存的特征提取"""
-    cache_key = FeatureCache.get_key(audio_path)
-    cached_result = FeatureCache.get(cache_key)
-    if cached_result:
-        logger.info(f"请求[{request_id}] 缓存命中")
-        return cached_result
-    
-    logger.info(f"请求[{request_id}] 缓存未命中，开始特征提取")
-    feature_result = extract_7features(audio_path, request_id)
-    
-    if not feature_result.feature_warnings or "失败" not in feature_result.feature_warnings[0]:
-        FeatureCache.set(cache_key, feature_result)
-        logger.info(f"请求[{request_id}] 特征结果已缓存")
-    
-    return feature_result
-
 # ===================== PD亚型概率计算 =====================
 def calculate_subtype_probs(feature_dict: Dict[str, float], pd_prob: float, request_id="unknown") -> Dict[str, float]:
     """计算PD亚型概率"""
@@ -916,11 +849,9 @@ def detailed_health():
         "status": "healthy",
         "ffmpeg_available": check_ffmpeg(),
         "model_loaded": ModelManager._model is not None,
-        "cache_size": len(FeatureCache._cache),
         "config": {
             "max_workers": CONFIG["MAX_WORKERS"],
-            "timeout": CONFIG["ANALYSIS_TIMEOUT_SECONDS"],
-            "cache_max_size": CONFIG["CACHE_MAX_SIZE"]
+            "timeout": CONFIG["ANALYSIS_TIMEOUT_SECONDS"]
         }
     }), 200
 
@@ -975,11 +906,11 @@ def pd_diagnose():
         
         logger.info(f"请求[{request_id}] 音频时长: {duration:.2f}秒")
         
-        # 特征提取
+        # 特征提取 - 直接调用，不使用缓存
         logger.info(f"请求[{request_id}] 开始特征提取")
         try:
             with ThreadPoolExecutor(max_workers=1) as thread_executor:
-                future_feat = thread_executor.submit(extract_7features_with_cache, converted_path, request_id)
+                future_feat = thread_executor.submit(extract_7features, converted_path, request_id)
                 feature_result = future_feat.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
             logger.info(f"请求[{request_id}] 特征提取完成")
         except TimeoutError:
@@ -1054,29 +985,6 @@ def pd_diagnose():
         }), 500
     finally:
         cleanup_temp_files(temp_paths)
-
-# ===================== 缓存管理接口 =====================
-@app.route('/cache/clear', methods=['POST'])
-def clear_cache():
-    """清空缓存"""
-    auth_key = request.headers.get('X-Admin-Key')
-    if auth_key != os.environ.get('ADMIN_KEY', 'admin-secret-key'):
-        return jsonify({"code": 403, "msg": "无权访问"}), 403
-    
-    FeatureCache.clear()
-    return jsonify({"code": 200, "msg": "缓存已清空"}), 200
-
-@app.route('/cache/stats', methods=['GET'])
-def cache_stats():
-    """缓存统计"""
-    return jsonify({
-        "code": 200,
-        "data": {
-            "cache_size": len(FeatureCache._cache),
-            "max_size": CONFIG["CACHE_MAX_SIZE"],
-            "cache_keys": list(FeatureCache._cache.keys())[:5] if FeatureCache._cache else []
-        }
-    }), 200
 
 # ===================== 调试接口 =====================
 @app.route('/debug/feature/<path:filename>', methods=['GET'])
