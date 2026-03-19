@@ -42,9 +42,9 @@ if sys.stderr.encoding != 'utf-8':
 CONFIG = {
     "SAMPLING_RATE": 16000,
     "TEMP_DIR": tempfile.gettempdir(),
-    "MODEL_PATH": "./model_rank1_Bernoulli_NB.pkl",
-    "PREPROCESSOR_PATH": "./preprocessor.pkl",
-    "FEATURE_ORDER_PATH": "./shap_importance.pkl",
+    "MODEL_PATH": "./model_rank1_Logistic_Regression(slight).pkl",
+    "PREPROCESSOR_PATH": "./preprocessor(slight).pkl",
+    "FEATURE_ORDER_PATH": "./shap_importance(slight).pkl",
     "PD_THRESHOLD": 0.5,
     "MIN_AUDIO_DURATION": 1.0,
     "MAX_AUDIO_DURATION": 210.0,
@@ -53,15 +53,15 @@ CONFIG = {
     "CACHE_MAX_SIZE": 3,
     "MAX_WORKERS": 1,
     
-    # ⚠️ 重要：严格保持LASSO筛选后的顺序
+    # ⚠️ 新的7个目标特征（严格按照LASSO筛选后的顺序）
     "TARGET_FEATURES": [
-        "F0_slope_mean",   # 索引0 - LASSO筛选第1
-        "F2_std_mean",     # 索引1 - LASSO筛选第2
-        "DFA_mean",        # 索引2 - LASSO筛选第3
-        "Delta0_mean",     # 索引3 - LASSO筛选第4
-        "Delta2_mean",     # 索引4 - LASSO筛选第5
-        "MFCC3_mean",      # 索引5 - LASSO筛选第6
-        "F2_std_std"       # 索引6 - LASSO筛选第7
+        "F0_max_std",      # 索引0
+        "Delta0_mean",      # 索引1
+        "Delta2_mean",      # 索引2
+        "F0_slope_mean",    # 索引3
+        "F2_std_mean",      # 索引4
+        "DFA_mean",         # 索引5
+        "MFCC4_mean"        # 索引6
     ],
     
     "SUBTYPE_WEIGHTS": {
@@ -70,24 +70,24 @@ CONFIG = {
             "DFA_mean": 0.20,
             "F0_slope_mean": 0.15,
             "Delta0_mean": 0.25,
-            "MFCC3_mean": 0.15
+            "MFCC4_mean": 0.15
         },
         "rigidity": {
             "F0_slope_mean": -0.30,
             "F2_std_mean": -0.25,
-            "F2_std_std": -0.20,
+            "F0_max_std": -0.20,
             "Delta2_mean": -0.15,
-            "MFCC3_mean": -0.10
+            "MFCC4_mean": -0.10
         },
         "motor": {
             "DFA_mean": 0.25,
             "Delta2_mean": 0.20,
             "F0_slope_mean": 0.20,
             "F2_std_mean": 0.20,
-            "F2_std_std": 0.15
+            "F0_max_std": 0.15
         },
         "non_motor": {
-            "MFCC3_mean": 0.30,
+            "MFCC4_mean": 0.30,
             "Delta0_mean": 0.25,
             "DFA_mean": 0.25,
             "F0_slope_mean": 0.20
@@ -101,7 +101,7 @@ CONFIG = {
         "tremor": "震颤主导型：以Delta2_mean和Delta0_mean升高为特征",
         "rigidity": "僵直主导型：以F0_slope_mean和F2_std降低为特征",
         "motor": "运动型：以DFA_mean和Delta2_mean升高为特征",
-        "non_motor": "非运动型：以MFCC3_mean和Delta0_mean改变为特征"
+        "non_motor": "非运动型：以MFCC4_mean和Delta0_mean改变为特征"
     },
     
     "PRAAT_PARAMS": {
@@ -514,9 +514,23 @@ def convert_audio_sync(input_path: str, output_path: str, request_id="unknown") 
         logger.error(f"请求[{request_id}] FFmpeg转换异常: {e}", exc_info=True)
         return False
 
-# ===================== 特征提取（增强日志） =====================
+# ===================== 修正后的特征提取函数 =====================
+
+def extract_f0_max(seg, sr, fmin=75, fmax=500, request_id="unknown", segment_idx=0):
+    """提取F0_max：基频最大值"""
+    try:
+        snd = parselmouth.Sound(seg, sr)
+        pitch = call(snd, "To Pitch", 0.001, fmin, fmax)
+        f0_max = call(pitch, "Get maximum", 0, 0, "Hertz", "Parabolic")
+        result = float(f0_max) if not np.isnan(f0_max) else 0.0
+        logger.debug(f"请求[{request_id}] 分段{segment_idx} F0_max={result:.4f}")
+        return result
+    except Exception as e:
+        logger.debug(f"请求[{request_id}] 分段{segment_idx} F0_max提取失败: {e}")
+        return 0.0
+
 def extract_f0_slope(seg, sr, fmin=75, fmax=500, request_id="unknown", segment_idx=0):
-    """提取F0_slope"""
+    """提取F0_slope：基频斜率"""
     try:
         snd = parselmouth.Sound(seg, sr)
         pitch = call(snd, "To Pitch", 0.001, fmin, fmax)
@@ -528,12 +542,13 @@ def extract_f0_slope(seg, sr, fmin=75, fmax=500, request_id="unknown", segment_i
             return float(slope)
         else:
             logger.debug(f"请求[{request_id}] 分段{segment_idx} 有效基频点不足: {len(pitch_arr)}")
+            return 0.0
     except Exception as e:
         logger.debug(f"请求[{request_id}] 分段{segment_idx} F0_slope提取失败: {e}")
-    return 0.0
+        return 0.0
 
 def extract_f2_std(seg, sr, request_id="unknown", segment_idx=0):
-    """提取F2_std"""
+    """提取F2_std：第二共振峰标准差"""
     try:
         snd = parselmouth.Sound(seg, sr)
         formant = call(snd, "To Formant (burg)", 0.0, 5, 5500, 0.025, 50)
@@ -546,7 +561,7 @@ def extract_f2_std(seg, sr, request_id="unknown", segment_idx=0):
         return 0.0
 
 def extract_dfa(seg, request_id="unknown", segment_idx=0):
-    """提取DFA"""
+    """提取DFA：去趋势波动分析"""
     try:
         if len(seg) < 200:
             logger.debug(f"请求[{request_id}] 分段{segment_idx} 信号太短({len(seg)}), 无法计算DFA")
@@ -559,26 +574,39 @@ def extract_dfa(seg, request_id="unknown", segment_idx=0):
         return 0.0
 
 def extract_mfcc_and_delta(seg, sr, request_id="unknown", segment_idx=0):
-    """提取MFCC3, Delta0, Delta2"""
+    """
+    提取MFCC和Delta特征
+    返回: (MFCC4, Delta0, Delta2) 注意这里是每个语音段的原始值，不是均值
+    """
     try:
         mfccs = librosa.feature.mfcc(
-            y=seg, sr=sr, n_mfcc=6, 
+            y=seg, sr=sr, n_mfcc=5,  # 需要MFCC4，所以至少5个
             n_fft=512, hop_length=128
         )
         delta = librosa.feature.delta(mfccs)
         
-        mfcc3 = float(mfccs[3].mean()) if len(mfccs) > 3 else 0.0
-        delta0 = float(delta[0].mean()) if len(delta) > 0 else 0.0
-        delta2 = float(delta[2].mean()) if len(delta) > 2 else 0.0
+        mfcc4 = float(mfccs[4].mean()) if len(mfccs) > 4 else 0.0  # MFCC4的均值
+        delta0 = float(delta[0].mean()) if len(delta) > 0 else 0.0  # Delta0的均值
+        delta2 = float(delta[2].mean()) if len(delta) > 2 else 0.0  # Delta2的均值
         
-        logger.debug(f"请求[{request_id}] 分段{segment_idx} MFCC3={mfcc3:.4f}, Delta0={delta0:.4f}, Delta2={delta2:.4f}")
-        return mfcc3, delta0, delta2
+        logger.debug(f"请求[{request_id}] 分段{segment_idx} MFCC4={mfcc4:.4f}, Delta0={delta0:.4f}, Delta2={delta2:.4f}")
+        return mfcc4, delta0, delta2
     except Exception as e:
         logger.debug(f"请求[{request_id}] 分段{segment_idx} MFCC/Delta提取失败: {e}")
         return 0.0, 0.0, 0.0
 
 def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
-    """只提取7个目标特征（增强日志）"""
+    """
+    提取7个目标特征（严格按照原始代码逻辑）
+    特征列表：
+    1. F0_max_std - 各语音段F0_max的标准差
+    2. Delta0_mean - 各语音段Delta0的均值
+    3. Delta2_mean - 各语音段Delta2的均值
+    4. F0_slope_mean - 各语音段F0_slope的均值
+    5. F2_std_mean - 各语音段F2_std的均值
+    6. DFA_mean - 各语音段DFA的均值
+    7. MFCC4_mean - 各语音段MFCC4的均值
+    """
     warnings = []
     segment_features = []
     
@@ -593,24 +621,26 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
         # 静音修剪
         y_trimmed, _ = librosa.effects.trim(y_raw, top_db=20)
         logger.debug(f"请求[{request_id}] 修剪后长度: {len(y_trimmed)} 采样点")
-        del y_raw  # 释放原始音频内存
-        gc.collect()
-
+        
+        # 取前0.3秒作为噪音样本
+        noise_sample = y_trimmed[:int(0.3 * CONFIG["SAMPLING_RATE"])]
+        
         # 降噪
         logger.debug(f"请求[{request_id}] 开始降噪...")
         y_denoised = reduce_noise(
-            y=y_trimmed, 
-            sr=CONFIG["SAMPLING_RATE"], 
-            stationary=True, 
+            y=y_trimmed,
+            y_noise=noise_sample,
+            sr=CONFIG["SAMPLING_RATE"],
+            stationary=True,
             prop_decrease=0.6
         )
         logger.debug(f"请求[{request_id}] 降噪完成")
         
         # 分割语音段
         intervals = librosa.effects.split(
-            y_denoised, 
-            top_db=25, 
-            frame_length=512, 
+            y_denoised,
+            top_db=25,
+            frame_length=512,
             hop_length=128
         )
         
@@ -630,20 +660,26 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
             if dur < 0.3:
                 logger.debug(f"请求[{request_id}] 语音段{idx} 太短，跳过")
                 continue
-                
+            
+            # 提取原始音频段用于Praat特征
             seg_raw = y_trimmed[start:end].astype(np.float32)
+            # 提取降噪后的音频段用于MFCC特征
             seg_denoised = y_denoised[start:end].astype(np.float32)
             
+            # 提取每个语音段的原始特征（注意：这里提取的是基础特征，不是最终的_mean/_std）
+            f0_max = extract_f0_max(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             f0_slope = extract_f0_slope(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             f2_std = extract_f2_std(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             dfa = extract_dfa(seg_raw, request_id=request_id, segment_idx=idx)
-            mfcc3, delta0, delta2 = extract_mfcc_and_delta(seg_denoised, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
+            mfcc4, delta0, delta2 = extract_mfcc_and_delta(seg_denoised, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             
+            # 保存每个语音段的基础特征
             segment_features.append({
+                'F0_max': f0_max,
                 'F0_slope': f0_slope,
                 'F2_std': f2_std,
                 'DFA': dfa,
-                'MFCC3': mfcc3,
+                'MFCC4': mfcc4,
                 'Delta0': delta0,
                 'Delta2': delta2
             })
@@ -654,33 +690,52 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
             seg_raw = y_trimmed.astype(np.float32)
             seg_denoised = y_denoised.astype(np.float32)
             
+            f0_max = extract_f0_max(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=0)
             f0_slope = extract_f0_slope(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=0)
             f2_std = extract_f2_std(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=0)
             dfa = extract_dfa(seg_raw, request_id=request_id, segment_idx=0)
-            mfcc3, delta0, delta2 = extract_mfcc_and_delta(seg_denoised, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=0)
+            mfcc4, delta0, delta2 = extract_mfcc_and_delta(seg_denoised, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=0)
             
             segment_features.append({
+                'F0_max': f0_max,
                 'F0_slope': f0_slope,
                 'F2_std': f2_std,
                 'DFA': dfa,
-                'MFCC3': mfcc3,
+                'MFCC4': mfcc4,
                 'Delta0': delta0,
                 'Delta2': delta2
             })
         
-        # 聚合特征
+        # 转换为DataFrame进行聚合
         df = pd.DataFrame(segment_features)
         logger.info(f"请求[{request_id}] 有效语音段数: {len(df)}")
         
-        # 计算统计量
+        # 关键修改：按照原始代码的逻辑计算特征
+        # 1. 对MFCC和Delta特征取均值（它们已经在每个语音段内是均值了）
+        # 2. 对其他特征（非MFCC/Delta）可以取均值和标准差，但这里我们只需要特定的7个
+        
+        # 计算最终需要的7个特征
         feature_dict = {
-            "F0_slope_mean": float(df['F0_slope'].mean()),
-            "F2_std_mean": float(df['F2_std'].mean()),
-            "DFA_mean": float(df['DFA'].mean()),
+            # F0_max_std：各语音段F0_max的标准差
+            "F0_max_std": float(df['F0_max'].std()) if len(df) > 1 else 0.0,
+            
+            # Delta0_mean：各语音段Delta0的均值
             "Delta0_mean": float(df['Delta0'].mean()),
+            
+            # Delta2_mean：各语音段Delta2的均值
             "Delta2_mean": float(df['Delta2'].mean()),
-            "MFCC3_mean": float(df['MFCC3'].mean()),
-            "F2_std_std": float(df['F2_std'].std()) if len(df) > 1 else 0.0
+            
+            # F0_slope_mean：各语音段F0_slope的均值
+            "F0_slope_mean": float(df['F0_slope'].mean()),
+            
+            # F2_std_mean：各语音段F2_std的均值
+            "F2_std_mean": float(df['F2_std'].mean()),
+            
+            # DFA_mean：各语音段DFA的均值
+            "DFA_mean": float(df['DFA'].mean()),
+            
+            # MFCC4_mean：各语音段MFCC4的均值
+            "MFCC4_mean": float(df['MFCC4'].mean())
         }
         
         # 记录每个特征的统计信息
@@ -692,7 +747,7 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
         for idx, seg_feat in enumerate(segment_features):
             logger.debug(f"请求[{request_id}] 分段{idx}特征: {seg_feat}")
         
-        del y_trimmed, y_denoised, df
+        del y_raw, y_trimmed, y_denoised, df
         gc.collect()
 
         return FeatureResult(
