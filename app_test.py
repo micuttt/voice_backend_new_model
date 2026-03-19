@@ -418,55 +418,23 @@ def cleanup_temp_files(temp_paths: List[str]):
                 logger.warning(f"删除临时文件失败 {path}: {e}")
 
 def convert_audio_sync(input_path: str, output_path: str, request_id="unknown") -> bool:
-    """同步音频转换（确保进程完全退出）"""
-    ffmpeg_cmd = [
-        "ffmpeg", "-i", input_path,
-        "-ar", str(CONFIG["SAMPLING_RATE"]),
-        "-ac", "1", "-sample_fmt", "s16",
-        "-c:a", "pcm_s16le", "-y", output_path
-    ]
-    
-    logger.debug(f"请求[{request_id}] FFmpeg命令: {' '.join(ffmpeg_cmd)}")
-    
-    process = None
     try:
-        # 使用 Popen 而不是 run，这样能更好地控制进程
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i", input_path,
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-y", output_path
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10
         )
-        
-        # 等待完成（带超时）
-        try:
-            stdout, stderr = process.communicate(timeout=CONFIG["FFMPEG_TIMEOUT"])
-            
-            if process.returncode == 0:
-                logger.debug(f"请求[{request_id}] FFmpeg转换成功")
-                return True
-            else:
-                logger.error(f"请求[{request_id}] FFmpeg转换失败: {stderr}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            logger.error(f"请求[{request_id}] FFmpeg转换超时")
-            process.kill()  # 强制杀死进程
-            process.wait()  # 等待进程完全退出
-            return False
-            
-    except Exception as e:
-        logger.error(f"请求[{request_id}] FFmpeg转换异常: {e}", exc_info=True)
+        return True
+    except:
         return False
-    finally:
-        # **关键：确保进程完全退出**
-        if process and process.poll() is None:  # 如果进程还在运行
-            try:
-                process.kill()
-                process.wait(timeout=5)
-                logger.debug(f"请求[{request_id}] 已强制终止FFmpeg进程")
-            except:
-                pass
 # ===================== 修正后的特征提取函数 =====================
 
 def extract_f0_max(seg, sr, fmin=75, fmax=500, request_id="unknown", segment_idx=0):
