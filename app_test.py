@@ -50,7 +50,6 @@ CONFIG = {
     "MAX_AUDIO_DURATION": 210.0,
     "ANALYSIS_TIMEOUT_SECONDS": 180,
     "FFMPEG_TIMEOUT": 30,
-    "FFMPEG_CHECK_TIMEOUT": 10,
     "MAX_WORKERS": 1,
     
     # ⚠️ 新的7个目标特征（严格按照LASSO筛选后的顺序）
@@ -112,15 +111,6 @@ CONFIG = {
     "RATE_LIMIT": {
         "requests_per_minute": 30,
         "requests_per_hour": 500
-    },
-    
-    # 语音分割优化参数
-    "VOICE_SEGMENTATION": {
-        "top_db": 20,           # 能量阈值（从25降到20，更敏感）
-        "frame_length": 256,     # 帧长（从512减半，更精细）
-        "hop_length": 64,        # 步长（对应调整）
-        "min_segment_duration": 0.3,  # 最小语音段时长
-        "min_silence_duration": 0.2    # 最小静音时长（用于合并）
     }
 }
 
@@ -149,15 +139,6 @@ console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(level
 console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
-# 添加文件处理器
-try:
-    file_handler = EncodingFileHandler('pd_diagnoser.log', encoding='utf-8')
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    file_handler.setLevel(logging.DEBUG)
-    logger.addHandler(file_handler)
-except Exception as e:
-    logger.warning(f"无法创建日志文件: {e}")
-
 # ===================== 全局线程池 =====================
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"])
 
@@ -179,185 +160,6 @@ class DiagnosisResult:
     feature_warnings: List[str]
     processing_time: float
     raw_features_scaled: np.ndarray = None  # 新增：保存标准化后的特征
-
-# ===================== FFmpeg管理类 =====================
-class FFmpegManager:
-    """FFmpeg进程管理器，带重试和监控"""
-    
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.total_calls = 0
-        self.failed_calls = 0
-        self.last_success = None
-        self.last_failure = None
-        self.is_healthy = True
-        self.last_check = 0
-        self.check_interval = 60  # 每60秒检查一次
-        
-    def check(self, force=False) -> bool:
-        """检查ffmpeg是否可用（带重试机制）"""
-        current_time = time.time()
-        
-        # 如果距离上次检查时间较短且不是强制检查，返回上次结果
-        if not force and current_time - self.last_check < self.check_interval:
-            return self.is_healthy
-        
-        with self.lock:
-            for attempt in range(3):  # 重试3次
-                try:
-                    logger.debug(f"检查FFmpeg可用性 (尝试 {attempt + 1}/3)")
-                    result = subprocess.run(
-                        ['ffmpeg', '-version'], 
-                        capture_output=True, 
-                        text=True,
-                        timeout=CONFIG["FFMPEG_CHECK_TIMEOUT"],
-                        env=os.environ.copy()  # 使用干净的环境变量
-                    )
-                    
-                    if result.returncode == 0:
-                        self.is_healthy = True
-                        self.last_success = current_time
-                        self.last_check = current_time
-                        self.total_calls += 1
-                        logger.debug("FFmpeg检查成功")
-                        return True
-                    else:
-                        logger.warning(f"FFmpeg返回错误码: {result.returncode} (尝试 {attempt + 1}/3)")
-                        
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"FFmpeg检查超时 (尝试 {attempt + 1}/3)")
-                except Exception as e:
-                    logger.warning(f"FFmpeg检查异常: {e} (尝试 {attempt + 1}/3)")
-                
-                # 失败后尝试清理
-                self._cleanup_stuck_processes()
-                
-                if attempt < 2:  # 最后一次尝试后不等待
-                    time.sleep(2 ** attempt)  # 指数退避：2s, 4s
-            
-            # 所有尝试都失败
-            self.is_healthy = False
-            self.last_failure = current_time
-            self.failed_calls += 1
-            self.last_check = current_time
-            logger.error("FFmpeg检查失败，所有重试都失败了")
-            return False
-    
-    def _cleanup_stuck_processes(self):
-        """清理卡住的ffmpeg进程"""
-        try:
-            subprocess.run(['pkill', '-f', 'ffmpeg'], 
-                          capture_output=True, 
-                          timeout=5)
-            logger.debug("已清理卡住的ffmpeg进程")
-        except Exception as e:
-            logger.warning(f"清理ffmpeg进程失败: {e}")
-    
-    def get_stats(self) -> Dict:
-        """获取统计信息"""
-        with self.lock:
-            success_rate = 0
-            if self.total_calls > 0:
-                success_rate = (self.total_calls - self.failed_calls) / self.total_calls
-            
-            return {
-                "total_calls": self.total_calls,
-                "failed_calls": self.failed_calls,
-                "success_rate": round(success_rate, 3),
-                "is_healthy": self.is_healthy,
-                "last_success": self.last_success,
-                "last_failure": self.last_failure,
-                "last_check": self.last_check
-            }
-
-# 创建全局FFmpeg管理器
-ffmpeg_manager = FFmpegManager()
-
-# ===================== 请求追踪器 =====================
-class RequestTracker:
-    """追踪请求状态"""
-    
-    def __init__(self):
-        self.requests = {}
-        self.lock = threading.Lock()
-        self.max_tracked = 100  # 最多追踪100个请求
-        
-    def start_request(self, request_id: str):
-        """记录请求开始"""
-        with self.lock:
-            # 清理旧请求
-            if len(self.requests) > self.max_tracked:
-                oldest = min(self.requests.keys(), 
-                           key=lambda k: self.requests[k]['start_time'])
-                del self.requests[oldest]
-            
-            self.requests[request_id] = {
-                'start_time': time.time(),
-                'status': 'processing',
-                'last_update': time.time()
-            }
-            
-            # 写入文件日志（可选）
-            try:
-                with open('requests.log', 'a', encoding='utf-8') as f:
-                    f.write(f"{time.time()},{request_id},start\n")
-            except:
-                pass
-    
-    def update_request(self, request_id: str, status: str, message: str = ""):
-        """更新请求状态"""
-        with self.lock:
-            if request_id in self.requests:
-                self.requests[request_id]['status'] = status
-                self.requests[request_id]['last_update'] = time.time()
-                if message:
-                    self.requests[request_id]['message'] = message
-    
-    def complete_request(self, request_id: str, success: bool = True):
-        """请求完成"""
-        with self.lock:
-            if request_id in self.requests:
-                self.requests[request_id]['status'] = 'completed' if success else 'failed'
-                self.requests[request_id]['end_time'] = time.time()
-                self.requests[request_id]['duration'] = time.time() - self.requests[request_id]['start_time']
-            
-            # 写入文件日志
-            try:
-                with open('requests.log', 'a', encoding='utf-8') as f:
-                    f.write(f"{time.time()},{request_id},{'success' if success else 'failed'}\n")
-            except:
-                pass
-    
-    def get_stuck_requests(self, timeout: float = 180) -> List[str]:
-        """获取卡住的请求"""
-        stuck = []
-        current_time = time.time()
-        
-        with self.lock:
-            for rid, info in self.requests.items():
-                if info['status'] == 'processing':
-                    duration = current_time - info['start_time']
-                    if duration > timeout:
-                        stuck.append(rid)
-        
-        return stuck
-    
-    def get_stats(self) -> Dict:
-        """获取统计信息"""
-        with self.lock:
-            active = sum(1 for r in self.requests.values() if r['status'] == 'processing')
-            completed = sum(1 for r in self.requests.values() if r['status'] == 'completed')
-            failed = sum(1 for r in self.requests.values() if r['status'] == 'failed')
-            
-            return {
-                'active': active,
-                'completed': completed,
-                'failed': failed,
-                'total_tracked': len(self.requests)
-            }
-
-# 创建全局请求追踪器
-request_tracker = RequestTracker()
 
 # ===================== 限流装饰器 =====================
 class RateLimiter:
@@ -566,24 +368,15 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 def check_ffmpeg():
-    """检查ffmpeg是否可用（兼容旧接口）"""
-    return ffmpeg_manager.check()
-
-def warmup_ffmpeg():
-    """服务启动时预热ffmpeg"""
-    logger.info("预热FFmpeg...")
+    """检查ffmpeg是否可用"""
     try:
-        # 执行一个简单的ffmpeg命令
-        result = subprocess.run(
-            ['ffmpeg', '-version'],
-            capture_output=True,
-            timeout=10,
-            check=True
-        )
-        logger.info("✅ FFmpeg预热成功")
-        return True
+        result = subprocess.run(['ffmpeg', '-version'], 
+                               capture_output=True, 
+                               text=True,
+                               timeout=20)
+        return result.returncode == 0
     except Exception as e:
-        logger.error(f"❌ FFmpeg预热失败: {e}")
+        logger.error(f"FFmpeg检查失败: {e}")
         return False
 
 def validate_audio_duration(audio_path: str) -> Tuple[bool, float, str]:
@@ -636,79 +429,56 @@ def cleanup_temp_files(temp_paths: List[str]):
             except Exception as e:
                 logger.warning(f"删除临时文件失败 {path}: {e}")
 
-def segment_audio(y, sr, request_id="unknown"):
-    """改进的语音分割函数"""
-    # 使用优化的参数检测非静音区间
-    intervals = librosa.effects.split(
-        y,
-        top_db=CONFIG["VOICE_SEGMENTATION"]["top_db"],
-        frame_length=CONFIG["VOICE_SEGMENTATION"]["frame_length"],
-        hop_length=CONFIG["VOICE_SEGMENTATION"]["hop_length"]
-    )
-    
-    logger.debug(f"请求[{request_id}] 初始检测到 {len(intervals)} 个语音段")
-    
-    # 合并时间间隔太近的段
-    min_silence = CONFIG["VOICE_SEGMENTATION"]["min_silence_duration"] * sr
-    merged = []
-    
-    for start, end in intervals:
-        if merged and start - merged[-1][1] < min_silence:
-            # 合并到上一个段
-            merged[-1] = (merged[-1][0], end)
-            logger.debug(f"请求[{request_id}] 合并语音段: ({merged[-1][0]}, {merged[-1][1]})")
-        else:
-            merged.append((start, end))
-    
-    logger.debug(f"请求[{request_id}] 合并后得到 {len(merged)} 个语音段")
-    return merged
-
 def convert_audio_sync(input_path: str, output_path: str, request_id="unknown") -> bool:
-    """同步音频转换（带重试机制和进程清理）"""
+    """同步音频转换（确保进程完全退出）"""
     ffmpeg_cmd = [
         "ffmpeg", "-i", input_path,
         "-ar", str(CONFIG["SAMPLING_RATE"]),
         "-ac", "1", "-sample_fmt", "s16",
-        "-c:a", "pcm_s16le",
-        "-y", output_path
+        "-c:a", "pcm_s16le", "-y", output_path
     ]
     
     logger.debug(f"请求[{request_id}] FFmpeg命令: {' '.join(ffmpeg_cmd)}")
     
-    # 重试3次
-    for attempt in range(3):
+    process = None
+    try:
+        # 使用 Popen 而不是 run，这样能更好地控制进程
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # 等待完成（带超时）
         try:
-            # 每次尝试前清理可能卡住的进程
-            if attempt > 0:
-                ffmpeg_manager._cleanup_stuck_processes()
-                time.sleep(2 ** attempt)  # 指数退避：2s, 4s
+            stdout, stderr = process.communicate(timeout=CONFIG["FFMPEG_TIMEOUT"])
             
-            result = subprocess.run(
-                ffmpeg_cmd,
-                capture_output=True,
-                text=True,
-                timeout=CONFIG["FFMPEG_TIMEOUT"]
-            )
-            
-            if result.returncode == 0:
-                logger.debug(f"请求[{request_id}] FFmpeg转换成功 (尝试 {attempt + 1})")
-                ffmpeg_manager.total_calls += 1
-                ffmpeg_manager.last_success = time.time()
+            if process.returncode == 0:
+                logger.debug(f"请求[{request_id}] FFmpeg转换成功")
                 return True
-            
-            logger.warning(f"请求[{request_id}] FFmpeg转换失败 (尝试 {attempt + 1}): {result.stderr[:200]}")
-            
+            else:
+                logger.error(f"请求[{request_id}] FFmpeg转换失败: {stderr}")
+                return False
+                
         except subprocess.TimeoutExpired:
-            logger.warning(f"请求[{request_id}] FFmpeg转换超时 (尝试 {attempt + 1})")
-        except Exception as e:
-            logger.warning(f"请求[{request_id}] FFmpeg转换异常 (尝试 {attempt + 1}): {e}")
-    
-    # 所有尝试都失败
-    ffmpeg_manager.failed_calls += 1
-    ffmpeg_manager.last_failure = time.time()
-    logger.error(f"请求[{request_id}] FFmpeg转换失败，已重试3次")
-    return False
-
+            logger.error(f"请求[{request_id}] FFmpeg转换超时")
+            process.kill()  # 强制杀死进程
+            process.wait()  # 等待进程完全退出
+            return False
+            
+    except Exception as e:
+        logger.error(f"请求[{request_id}] FFmpeg转换异常: {e}", exc_info=True)
+        return False
+    finally:
+        # **关键：确保进程完全退出**
+        if process and process.poll() is None:  # 如果进程还在运行
+            try:
+                process.kill()
+                process.wait(timeout=5)
+                logger.debug(f"请求[{request_id}] 已强制终止FFmpeg进程")
+            except:
+                pass
 # ===================== 修正后的特征提取函数 =====================
 
 def extract_f0_max(seg, sr, fmin=75, fmax=500, request_id="unknown", segment_idx=0):
@@ -831,8 +601,13 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
         )
         logger.debug(f"请求[{request_id}] 降噪完成")
         
-        # 使用改进的语音分割函数
-        intervals = segment_audio(y_denoised, CONFIG["SAMPLING_RATE"], request_id)
+        # 分割语音段
+        intervals = librosa.effects.split(
+            y_denoised,
+            top_db=25,
+            frame_length=512,
+            hop_length=128
+        )
         
         logger.info(f"请求[{request_id}] 检测到 {len(intervals)} 个语音段")
         
@@ -847,7 +622,7 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
             
             logger.debug(f"请求[{request_id}] 语音段{idx}: 起点={start}, 终点={end}, 时长={dur:.2f}秒")
             
-            if dur < CONFIG["VOICE_SEGMENTATION"]["min_segment_duration"]:
+            if dur < 0.3:
                 logger.debug(f"请求[{request_id}] 语音段{idx} 太短，跳过")
                 continue
             
@@ -856,7 +631,7 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
             # 提取降噪后的音频段用于MFCC特征
             seg_denoised = y_denoised[start:end].astype(np.float32)
             
-            # 提取每个语音段的原始特征
+            # 提取每个语音段的原始特征（注意：这里提取的是基础特征，不是最终的_mean/_std）
             f0_max = extract_f0_max(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             f0_slope = extract_f0_slope(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
             f2_std = extract_f2_std(seg_raw, CONFIG["SAMPLING_RATE"], request_id=request_id, segment_idx=idx)
@@ -899,6 +674,10 @@ def extract_7features(audio_path: str, request_id="unknown") -> FeatureResult:
         # 转换为DataFrame进行聚合
         df = pd.DataFrame(segment_features)
         logger.info(f"请求[{request_id}] 有效语音段数: {len(df)}")
+        
+        # 关键修改：按照原始代码的逻辑计算特征
+        # 1. 对MFCC和Delta特征取均值（它们已经在每个语音段内是均值了）
+        # 2. 对其他特征（非MFCC/Delta）可以取均值和标准差，但这里我们只需要特定的7个
         
         # 计算最终需要的7个特征
         feature_dict = {
@@ -1062,10 +841,6 @@ def before_request():
     g.start_time = time.time()
     g.request_id = hashlib.md5(f"{time.time()}_{np.random.random()}".encode()).hexdigest()[:8]
     logger.info(f"请求[{g.request_id}]开始: {request.path} 方法: {request.method}")
-    
-    # 记录请求开始
-    if request.path == '/analyze':
-        request_tracker.start_request(g.request_id)
 
 @app.after_request
 def after_request(response):
@@ -1088,33 +863,14 @@ def health_check():
 @app.route('/health/detailed', methods=['GET'])
 def detailed_health():
     """详细健康检查"""
-    ffmpeg_stats = ffmpeg_manager.get_stats()
-    request_stats = request_tracker.get_stats()
-    
     return jsonify({
         "status": "healthy",
-        "ffmpeg": ffmpeg_stats,
-        "requests": request_stats,
+        "ffmpeg_available": check_ffmpeg(),
         "model_loaded": ModelManager._model is not None,
         "config": {
             "max_workers": CONFIG["MAX_WORKERS"],
-            "timeout": CONFIG["ANALYSIS_TIMEOUT_SECONDS"],
-            "voice_segmentation": CONFIG["VOICE_SEGMENTATION"]
+            "timeout": CONFIG["ANALYSIS_TIMEOUT_SECONDS"]
         }
-    }), 200
-
-@app.route('/health/ffmpeg', methods=['GET'])
-def ffmpeg_health():
-    """ffmpeg健康检查"""
-    stats = ffmpeg_manager.get_stats()
-    
-    # 强制检查
-    ffmpeg_manager.check(force=True)
-    stats_after = ffmpeg_manager.get_stats()
-    
-    return jsonify({
-        "before_check": stats,
-        "after_check": stats_after
     }), 200
 
 @app.route('/analyze', methods=['POST'])
@@ -1126,37 +882,20 @@ def pd_diagnose():
     
     try:
         logger.info(f"请求[{request_id}] 收到诊断请求")
-        request_tracker.update_request(request_id, 'processing', '收到请求')
         
         if 'file' not in request.files:
             logger.warning(f"请求[{request_id}] 未上传音频文件")
-            request_tracker.complete_request(request_id, False)
             return jsonify({"code": 400, "msg": "未上传音频文件"}), 400
         
         file = request.files['file']
         if file.filename == '':
             logger.warning(f"请求[{request_id}] 未选择音频文件")
-            request_tracker.complete_request(request_id, False)
             return jsonify({"code": 400, "msg": "未选择音频文件"}), 400
         
-        # 检查ffmpeg，但不要直接返回错误，而是尝试修复
-        if not ffmpeg_manager.check():
-            logger.warning(f"请求[{request_id}] FFmpeg检查失败，尝试修复...")
-            
-            # 尝试清理ffmpeg进程
-            ffmpeg_manager._cleanup_stuck_processes()
-            time.sleep(2)
-            
-            # 再次检查
-            if not ffmpeg_manager.check(force=True):
-                logger.error(f"请求[{request_id}] FFmpeg修复失败")
-                request_tracker.complete_request(request_id, False)
-                return jsonify({
-                    "code": 503,
-                    "msg": "音频处理服务暂时不可用，请稍后重试"
-                }), 503
+        if not check_ffmpeg():
+            logger.error(f"请求[{request_id}] FFmpeg不可用")
+            return jsonify({"code": 500, "msg": "服务器音频处理组件缺失"}), 500
         
-        request_tracker.update_request(request_id, 'processing', '文件接收中')
         logger.info(f"请求[{request_id}] 接收文件: {file.filename}, 大小: {file.content_length if file.content_length else '未知'}字节")
         
         temp_path = get_temp_path("upload")
@@ -1166,57 +905,45 @@ def pd_diagnose():
         file.save(temp_path)
         logger.info(f"请求[{request_id}] 临时文件已保存: {temp_path}")
         
-        # 音频转换
+         # 音频转换
         logger.info(f"请求[{request_id}] 开始音频转换")
-        request_tracker.update_request(request_id, 'processing', '音频转换中')
         try:
-            convert_start = time.time()
-            convert_result = convert_audio_sync(temp_path, converted_path, request_id)
-            convert_time = time.time() - convert_start
-            
+            convert_result = convert_audio_sync(temp_path, converted_path, request_id)  # 👈 使用修改后的函数
             if not convert_result:
                 raise Exception("音频转换失败")
-            logger.info(f"请求[{request_id}] 音频转换完成: {converted_path}，耗时: {convert_time:.2f}秒")
+            logger.info(f"请求[{request_id}] 音频转换完成: {converted_path}")
         except Exception as e:
             logger.error(f"请求[{request_id}] 音频转换异常: {e}", exc_info=True)
-            request_tracker.complete_request(request_id, False)
             return jsonify({"code": 500, "msg": f"音频转换失败: {str(e)}"}), 500
         
         # 验证时长
         valid, duration, msg = validate_audio_duration(converted_path)
         if not valid:
             logger.warning(f"请求[{request_id}] 音频时长验证失败: {msg}")
-            request_tracker.complete_request(request_id, False)
             return jsonify({"code": 400, "msg": msg}), 400
         
         logger.info(f"请求[{request_id}] 音频时长: {duration:.2f}秒")
         
-        # 特征提取
+        # 特征提取 - 直接调用，不使用缓存
         logger.info(f"请求[{request_id}] 开始特征提取")
-        request_tracker.update_request(request_id, 'processing', '特征提取中')
         try:
-            feature_start = time.time()
             with ThreadPoolExecutor(max_workers=1) as thread_executor:
                 future_feat = thread_executor.submit(extract_7features, converted_path, request_id)
                 feature_result = future_feat.result(timeout=CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
-            feature_time = time.time() - feature_start
-            logger.info(f"请求[{request_id}] 特征提取完成，耗时: {feature_time:.2f}秒")
+            logger.info(f"请求[{request_id}] 特征提取完成")
         except TimeoutError:
             logger.error(f"请求[{request_id}] 特征提取超时")
-            request_tracker.complete_request(request_id, False)
             return jsonify({
                 "code": 504,
                 "msg": "特征提取超时，请稍后重试"
             }), 504
         except Exception as e:
             logger.error(f"请求[{request_id}] 特征提取失败: {e}", exc_info=True)
-            request_tracker.complete_request(request_id, False)
             return jsonify({"code": 500, "msg": f"特征提取失败: {str(e)}"}), 500
         
         # 检查特征提取是否成功
         if feature_result.feature_warnings and "失败" in feature_result.feature_warnings[0]:
             logger.error(f"请求[{request_id}] 特征提取错误: {feature_result.feature_warnings[0]}")
-            request_tracker.complete_request(request_id, False)
             return jsonify({
                 "code": 500,
                 "msg": feature_result.feature_warnings[0]
@@ -1224,17 +951,13 @@ def pd_diagnose():
         
         # 诊断
         logger.info(f"请求[{request_id}] 开始诊断")
-        request_tracker.update_request(request_id, 'processing', '诊断中')
         try:
-            diagnose_start = time.time()
             with ThreadPoolExecutor(max_workers=1) as thread_executor:
                 future_diag = thread_executor.submit(diagnose, feature_result, request_id)
                 diagnosis_result = future_diag.result(timeout=30)
-            diagnose_time = time.time() - diagnose_start
-            logger.info(f"请求[{request_id}] 诊断完成，耗时: {diagnose_time:.2f}秒")
+            logger.info(f"请求[{request_id}] 诊断完成")
         except TimeoutError:
             logger.error(f"请求[{request_id}] 诊断超时")
-            request_tracker.complete_request(request_id, False)
             return jsonify({
                 "code": 504,
                 "msg": "诊断超时，请稍后重试"
@@ -1266,7 +989,6 @@ def pd_diagnose():
         }
         
         logger.info(f"请求[{request_id}] 诊断完成，总耗时{total_time:.2f}秒")
-        request_tracker.complete_request(request_id, True)
         
         # 转换numpy类型
         response = convert_numpy_type(response)
@@ -1275,13 +997,19 @@ def pd_diagnose():
         
     except Exception as e:
         logger.error(f"请求[{request_id}] 诊断异常: {e}", exc_info=True)
-        request_tracker.complete_request(request_id, False)
         return jsonify({
             "code": 500,
             "msg": f"诊断失败: {str(e)}"
         }), 500
     finally:
         cleanup_temp_files(temp_paths)
+        try:
+            subprocess.run(['pkill', '-f', 'ffmpeg'], 
+                          capture_output=True, 
+                          timeout=5)
+            logger.debug(f"请求[{request_id}] 已清理所有ffmpeg进程")
+        except:
+            pass
 
 # ===================== 调试接口 =====================
 @app.route('/debug/feature/<path:filename>', methods=['GET'])
@@ -1306,24 +1034,10 @@ def debug_feature(filename):
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
 
-# ===================== 监控接口 =====================
-@app.route('/monitor/stuck', methods=['GET'])
-def check_stuck_requests():
-    """检查卡住的请求"""
-    stuck = request_tracker.get_stuck_requests(CONFIG["ANALYSIS_TIMEOUT_SECONDS"])
-    return jsonify({
-        "stuck_count": len(stuck),
-        "stuck_requests": stuck
-    }), 200
-
 # ===================== 优雅关闭 =====================
 def signal_handler(signum, frame):
     """处理退出信号"""
     logger.info(f"收到信号 {signum}，正在优雅关闭...")
-    
-    # 给正在处理的请求一些完成时间
-    logger.info("等待当前请求完成...")
-    time.sleep(30)  # 等待30秒
     
     executor.shutdown(wait=True, cancel_futures=True)
     cleanup_temp_files(glob.glob(os.path.join(CONFIG["TEMP_DIR"], "*.wav")))
@@ -1340,9 +1054,9 @@ if __name__ == '__main__':
     print("PD语音诊断服务启动中...")
     print("="*60)
     
-    # 预热ffmpeg
-    if not warmup_ffmpeg():
-        logger.warning("FFmpeg预热失败，但服务将继续启动")
+    if not check_ffmpeg():
+        logger.error("ffmpeg未安装，请先安装ffmpeg")
+        exit(1)
     
     try:
         ModelManager.load_all()
@@ -1357,7 +1071,8 @@ if __name__ == '__main__':
     debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
     
     logger.info(f"🚀 服务启动在端口 {port}，调试模式: {debug}")
-    logger.info(f"📝 详细日志将写入: pd_diagnoser.log")
+    logger.info(f"📝 详细日志将写入: pd_diagnoser_detailed.log")
+    logger.info(f"⚠️  错误日志将写入: pd_diagnoser_errors.log")
     print("="*60)
     
     app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
