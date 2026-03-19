@@ -335,9 +335,6 @@ class ModelManager:
                     cls._model = joblib.load(CONFIG["MODEL_PATH"])
                     logger.info(f"加载模型成功: {type(cls._model).__name__}")
                     
-                    # 记录模型信息
-                    if hasattr(cls._model, 'get_params'):
-                        logger.debug(f"模型参数: {cls._model.get_params()}")
                     
                 except Exception as e:
                     logger.error(f"加载模型失败: {e}", exc_info=True)
@@ -426,7 +423,7 @@ def check_ffmpeg():
         result = subprocess.run(['ffmpeg', '-version'], 
                                capture_output=True, 
                                text=True,
-                               timeout=5)
+                               timeout=50)
         return result.returncode == 0
     except Exception as e:
         logger.error(f"FFmpeg检查失败: {e}")
